@@ -1,0 +1,7 @@
+{
+  "version": 3,
+  "sources": ["../src/index.ts"],
+  "sourcesContent": ["export { WebRtcTransport } from \"./webrtc.js\";\nexport type {\n  WebRtcTransportOptions,\n  WebRtcTransportServer,\n  WebRtcServerSessionView,\n} from \"./webrtc.js\";\nexport type {\n  WebRtcSessionView,\n  WebRtcTrackEvent,\n  WebRtcMediaController,\n  WebRtcTransportRequest,\n} from \"./types/types.js\";\n"],
+  "mappings": "aAAA,OAAS,oBAAuB",
+  "names": []
+}
