@@ -1,6 +1,6 @@
 {
   "name": "@hyperttp/transport-webrtc",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "WebRTC transport for Hyperttp powered by Werift",
   "keywords": [
     "bun",
@@ -38,7 +38,7 @@
     }
   },
   "scripts": {
-    "build": "tsc && d-build",
+    "build": "tsc && esbuild 'dist/**/*.js' --outdir=dist --allow-overwrite --minify --sourcemap && d-build",
     "dist": "d-dist",
     "deploy": "npm run build && npm run dist",
     "pub": "d-publish",
