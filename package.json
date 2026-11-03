@@ -1,0 +1,70 @@
+{
+  "name": "@hyperttp/transport-webrtc",
+  "version": "0.3.0",
+  "description": "WebRTC transport for Hyperttp powered by Werift",
+  "keywords": [
+    "bun",
+    "fetch",
+    "high-performance",
+    "http",
+    "hyperttp",
+    "transport"
+  ],
+  "license": "MIT",
+  "author": "dirold2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/IT-IF-OR/hyperttp-transport-webrtc.git"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "browser": {
+        "types": "./dist/browser.d.ts",
+        "import": "./dist/browser.js"
+      },
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./pcm-audio": {
+      "types": "./dist/pcm-audio.d.ts",
+      "import": "./dist/pcm-audio.js"
+    },
+    "./browser": {
+      "types": "./dist/browser.d.ts",
+      "import": "./dist/browser.js"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint src",
+    "lint:fix": "oxlint src --fix",
+    "format": "oxfmt src",
+    "format:check": "oxfmt src --check",
+    "test": "vitest run",
+    "dev": "tsx src/index.ts",
+    "build": "node ../../scripts/build-package.ts",
+    "clean": "node --input-type=module -e 'import { rmSync } from \"node:fs\"; rmSync(\"dist\", { recursive: true, force: true });'"
+  },
+  "dependencies": {
+    "werift": "^0.26.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "@types/node": "^26.6.6",
+    "esbuild": "^0.28.2",
+    "oxfmt": "^0.76.0",
+    "oxlint": "^1.90.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
+  },
+  "peerDependencies": {
+    "@hyperttp/types": "^0.5.4"
+  }
+}
