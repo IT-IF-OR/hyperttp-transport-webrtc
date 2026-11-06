@@ -218,7 +218,12 @@ export async function createPcmAudioSource(
       let iterator: AsyncIterator<Uint8Array>;
       if ("getReader" in input) {
         const reader = input.getReader();
-        iterator = { next: () => reader.read() };
+        iterator = {
+          next: async () => {
+            const result = await reader.read();
+            return result.done ? { done: true, value: undefined } : { done: false, value: result.value };
+          },
+        };
         cancelInput = () => reader.cancel();
         release = () => reader.releaseLock();
       } else {

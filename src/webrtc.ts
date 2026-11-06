@@ -12,6 +12,7 @@ import {
   type WebRtcServerSessionEvent,
   type PendingResponse,
   type ServerSession,
+  type ServerTrickleState,
   type WebRtcSessionView,
   type WebRtcTrackEvent,
   type WebRtcTransportOptions as InternalWebRtcTransportOptions,
@@ -223,7 +224,10 @@ export class WebRtcTransport implements HyperTransport {
       void (async () => {
         const sendJson = (status: number, body: unknown) => {
           if (res.headersSent || res.destroyed) return;
-          res.writeHead(status, { "content-type": "application/json" });
+          res.writeHead(status, {
+            "content-type": "application/json",
+            "cache-control": "no-store",
+          });
           res.end(JSON.stringify(body));
         };
 
@@ -247,7 +251,10 @@ export class WebRtcTransport implements HyperTransport {
 
         let ownerId: string | undefined;
         let authorization: unknown;
-        if ((req.method === "POST" || req.method === "DELETE") && options.signaling?.authorize) {
+        if (
+          ["POST", "DELETE", "GET", "PATCH"].includes(req.method ?? "") &&
+          options.signaling?.authorize
+        ) {
           const controller = new AbortController();
           const onDisconnect = () => controller.abort();
           const onAuthorizationAbort = () => {
@@ -264,7 +271,7 @@ export class WebRtcTransport implements HyperTransport {
             }
             const allowed = await options.signaling.authorize({
               protocol: "webrtc",
-              method: req.method,
+              method: req.method!,
               url: req.url ?? "/",
               headers,
               signal: controller.signal,
@@ -314,7 +321,40 @@ export class WebRtcTransport implements HyperTransport {
           return;
         }
 
-        if (req.method !== "POST") {
+        if (req.method === "GET") {
+          const id = parsedUrl.searchParams.get("sessionId");
+          const session = id ? this.serverSessions.get(id) : undefined;
+          if (!session || !id || !ownedSessions.has(id)) {
+            sendJson(404, { error: "Session not found" });
+            return;
+          }
+          if (session.context.ownerId !== ownerId) {
+            sendJson(403, { error: "Signaling forbidden" });
+            return;
+          }
+          const state = session.trickle;
+          if (!state || parsedUrl.searchParams.get("generation") !== state.generation) {
+            sendJson(409, { error: "ICE generation mismatch" });
+            return;
+          }
+          const cursor = parsedUrl.searchParams.get("cursor") ?? "0";
+          if (
+            !/^(0|[1-9][0-9]*)$/.test(cursor) ||
+            !Number.isSafeInteger(Number(cursor)) ||
+            Number(cursor) > state.candidates.length
+          ) {
+            sendJson(400, { error: "Invalid ICE cursor" });
+            return;
+          }
+          sendJson(200, {
+            generation: state.generation,
+            candidates: state.candidates.slice(Number(cursor)),
+            next: state.candidates.length,
+          });
+          return;
+        }
+
+        if (req.method !== "POST" && req.method !== "PATCH") {
           sendJson(405, { error: "Method not allowed" });
           return;
         }
@@ -340,8 +380,80 @@ export class WebRtcTransport implements HyperTransport {
           const payload = JSON.parse(raw) as {
             sessionId?: unknown;
             sdp?: RTCSessionDescriptionInit;
+            trickle?: unknown;
+            generation?: unknown;
+            candidate?: unknown;
           };
 
+          if (req.method === "PATCH") {
+            if (
+              !payload ||
+              typeof payload.sessionId !== "string" ||
+              typeof payload.generation !== "string" ||
+              !("candidate" in payload)
+            ) {
+              sendJson(400, { error: "Expected sessionId, generation and candidate" });
+              return;
+            }
+            const target = this.serverSessions.get(payload.sessionId);
+            if (!target || !ownedSessions.has(payload.sessionId)) {
+              sendJson(404, { error: "Session not found" });
+              return;
+            }
+            if (target.context.ownerId !== ownerId) {
+              sendJson(403, { error: "Signaling forbidden" });
+              return;
+            }
+            const state = target.trickle;
+            if (!state || state.generation !== payload.generation) {
+              sendJson(409, { error: "ICE generation mismatch" });
+              return;
+            }
+            const candidate = payload.candidate as RTCIceCandidateInit | null;
+            if (
+              candidate !== null &&
+              (typeof candidate !== "object" ||
+                typeof candidate.candidate !== "string" ||
+                candidate.candidate.length < 1 ||
+                candidate.candidate.length > 4096 ||
+                (candidate.sdpMid != null &&
+                  (typeof candidate.sdpMid !== "string" || candidate.sdpMid.length > 256)) ||
+                (candidate.sdpMLineIndex != null &&
+                  (!Number.isInteger(candidate.sdpMLineIndex) ||
+                    candidate.sdpMLineIndex < 0 ||
+                    candidate.sdpMLineIndex > 65535)) ||
+                (candidate.sdpMid == null && candidate.sdpMLineIndex == null) ||
+                (candidate.usernameFragment != null &&
+                  (typeof candidate.usernameFragment !== "string" ||
+                    candidate.usernameFragment.length > 256)))
+            ) {
+              sendJson(400, { error: "Invalid ICE candidate" });
+              return;
+            }
+            if (state.remoteEnded || state.remoteCount >= 256) {
+              sendJson(429, { error: "ICE candidate limit reached or gathering ended" });
+              return;
+            }
+            state.remoteCount++;
+            if (candidate === null) state.remoteEnded = true;
+            const apply = state.remoteQueue.then(async () => {
+              if (target.closed || target.trickle !== state)
+                throw new Error("ICE generation expired");
+              await target.peerConnection.addIceCandidate(candidate);
+            });
+            state.remoteQueue = apply.catch(() => {});
+            try {
+              await apply;
+              res.writeHead(204).end();
+            } catch {
+              sendJson(400, { error: "Failed to apply ICE candidate" });
+            }
+            return;
+          }
+          if (!payload || (payload.trickle !== undefined && typeof payload.trickle !== "boolean")) {
+            sendJson(400, { error: "Invalid trickle flag" });
+            return;
+          }
           if (
             typeof payload.sessionId !== "string" ||
             payload.sessionId.length < 1 ||
@@ -370,7 +482,7 @@ export class WebRtcTransport implements HyperTransport {
             sendJson(409, { error: "Session is closing" });
             return;
           }
-          if (session?.negotiating) {
+          if (session?.negotiating || session?.trickle?.gathering) {
             sendJson(409, { error: "Session negotiation already in progress" });
             return;
           }
@@ -403,6 +515,8 @@ export class WebRtcTransport implements HyperTransport {
             pc = session.peerConnection;
           }
 
+          session.trickle?.detach();
+          delete session.trickle;
           session.negotiating = true;
           const activeSession = session;
           const disconnect = () => {
@@ -420,9 +534,76 @@ export class WebRtcTransport implements HyperTransport {
           if (session.closed) throw new Error("WebRTC session closed");
 
           const answer = await pc.createAnswer();
-          await this.withDeadline(pc.setLocalDescription(answer), this.iceGatheringTimeoutMs);
-          if (!(await this.waitForIceGatheringComplete(pc, this.iceGatheringTimeoutMs)))
-            throw new Error("Full ICE gathering timed out; trickle ICE is not supported");
+          let state: ServerTrickleState | undefined;
+          if (payload.trickle === true) {
+            const peer = pc;
+            const onCandidate = (event: { candidate?: { toJSON(): RTCIceCandidateInit } }) => {
+              if (!state || activeSession.closed || activeSession.trickle !== state) return;
+              if (state.candidates.length >= 256) {
+                void this.closeServerSession(activeSession.id);
+                return;
+              }
+              state.candidates.push(event.candidate ? event.candidate.toJSON() : null);
+            };
+            peer.addEventListener("icecandidate", onCandidate);
+            state = {
+              generation: crypto.randomUUID(),
+              candidates: [],
+              gathering: true,
+              remoteCount: 0,
+              remoteEnded: false,
+              remoteQueue: Promise.resolve(),
+              detach: () => peer.removeEventListener("icecandidate", onCandidate),
+            };
+            session.trickle = state;
+            const applying = this.withDeadline(
+              peer.setLocalDescription(answer),
+              this.iceGatheringTimeoutMs,
+              session.controller.signal,
+            );
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+              await this.withDeadline(
+                new Promise<void>((resolve, reject) => {
+                  const check = () => {
+                    if (activeSession.closed) {
+                      reject(new Error("WebRTC session closed"));
+                      return;
+                    }
+                    if (
+                      peer.signalingState === "stable" &&
+                      peer.localDescription?.type === "answer"
+                    ) {
+                      resolve();
+                      return;
+                    }
+                    timer = setTimeout(check, 5);
+                  };
+                  void applying.catch(reject);
+                  check();
+                }),
+                this.iceGatheringTimeoutMs,
+                session.controller.signal,
+              );
+            } finally {
+              clearTimeout(timer);
+            }
+            void applying.then(
+              () => {
+                if (state && activeSession.trickle === state) {
+                  state.gathering = false;
+                  if (!state.candidates.includes(null)) state.candidates.push(null);
+                }
+              },
+              () => {
+                if (activeSession.trickle === state) void this.closeServerSession(activeSession.id);
+              },
+            );
+          } else {
+            await this.withDeadline(pc.setLocalDescription(answer), this.iceGatheringTimeoutMs);
+            if (!(await this.waitForIceGatheringComplete(pc, this.iceGatheringTimeoutMs)))
+              throw new Error("Full ICE gathering timed out; trickle ICE is not supported");
+          }
 
           const localDescription = pc.localDescription;
           if (!localDescription?.sdp || localDescription.type !== "answer") {
@@ -431,7 +612,10 @@ export class WebRtcTransport implements HyperTransport {
 
           if (closed || session.closed) throw new Error("WebRTC session closed");
           session.negotiating = false;
-          sendJson(200, localDescription);
+          sendJson(
+            200,
+            state ? { sdp: localDescription, generation: state.generation } : localDescription,
+          );
         } catch (error) {
           this.log("error", "[WebRtcTransport Server] Ошибка сигнализации:", error);
           if (session) {
@@ -815,6 +999,8 @@ export class WebRtcTransport implements HyperTransport {
       throw new Error(`Cannot negotiate WebRTC session in state ${pc.signalingState}`);
     }
 
+    if (this.options.trickleIce) return this.negotiateTrickle(session, signal);
+
     const offer = await pc.createOffer();
     await this.withDeadline(pc.setLocalDescription(offer), this.iceGatheringTimeoutMs, signal);
     await this.waitForIceGatheringComplete(pc, this.iceGatheringTimeoutMs);
@@ -861,6 +1047,228 @@ export class WebRtcTransport implements HyperTransport {
       clearTimeout(timer);
       signal?.removeEventListener("abort", abortListener);
     }
+  }
+
+  private async negotiateTrickle(session: ClientSession, signal?: AbortSignal): Promise<void> {
+    const pc = session.peerConnection;
+    const controller = new AbortController();
+    session.trickleAbort = controller;
+    const abort = () => controller.abort(signal?.reason);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    const candidates: (RTCIceCandidateInit | null)[] = [];
+    let ended = false;
+    let wake: (() => void) | undefined;
+    let failure: Error | undefined;
+    const onCandidate = (event: { candidate?: { toJSON(): RTCIceCandidateInit } }) => {
+      if (ended || controller.signal.aborted) return;
+      const candidate = event.candidate ? event.candidate.toJSON() : null;
+      if (candidate?.candidate === "") return;
+      if (candidates.length >= 256 || !this.validTrickleCandidate(candidate)) {
+        failure = new Error("Invalid or excessive local ICE candidates");
+      } else {
+        candidates.push(candidate);
+        if (candidate === null) ended = true;
+      }
+      wake?.();
+    };
+    pc.addEventListener("icecandidate", onCandidate);
+    let pollTimer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = setTimeout(
+      () => controller.abort(new Error("Trickle ICE timed out")),
+      this.iceGatheringTimeoutMs + this.signalingTimeoutMs,
+    );
+    try {
+      const offer = await this.withDeadline(
+        pc.createOffer(),
+        this.signalingTimeoutMs,
+        controller.signal,
+      );
+      const applying = this.withDeadline(
+        pc.setLocalDescription(offer),
+        this.iceGatheringTimeoutMs,
+        controller.signal,
+      );
+      await this.withDeadline(
+        new Promise<void>((resolve, reject) => {
+          const check = () => {
+            if (pc.signalingState === "have-local-offer" && pc.localDescription?.sdp)
+              return resolve();
+            pollTimer = setTimeout(check, 5);
+          };
+          void applying.catch(reject);
+          check();
+        }),
+        this.iceGatheringTimeoutMs,
+        controller.signal,
+      );
+      clearTimeout(pollTimer);
+      const response = await this.withDeadline(
+        fetch(session.signalingUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ sessionId: session.id, sdp: pc.localDescription, trickle: true }),
+          signal: controller.signal,
+        }),
+        this.signalingTimeoutMs,
+        controller.signal,
+      );
+      if (!response.ok)
+        throw new Error(`Signaling HTTP error: ${response.status} ${response.statusText}`);
+      const result: unknown = await this.withDeadline(
+        response.json(),
+        this.signalingTimeoutMs,
+        controller.signal,
+      );
+      if (
+        !result ||
+        typeof result !== "object" ||
+        !("generation" in result) ||
+        typeof result.generation !== "string" ||
+        !result.generation ||
+        result.generation.length > 256 ||
+        !("sdp" in result) ||
+        !result.sdp ||
+        typeof result.sdp !== "object" ||
+        !("type" in result.sdp) ||
+        result.sdp.type !== "answer" ||
+        !("sdp" in result.sdp) ||
+        typeof result.sdp.sdp !== "string" ||
+        !result.sdp.sdp
+      ) {
+        throw new Error("Signaling server returned an invalid trickle answer");
+      }
+      const generation = result.generation;
+      await this.withDeadline(
+        this.setRemoteDescription(pc, { type: "answer", sdp: result.sdp.sdp }),
+        this.signalingTimeoutMs,
+        controller.signal,
+      );
+      const upload = async () => {
+        let index = 0;
+        while (true) {
+          if (controller.signal.aborted) throw abortError(controller.signal);
+          if (failure) throw failure;
+          if (index === candidates.length) {
+            await new Promise<void>((resolve, reject) => {
+              const onAbort = () => {
+                wake = undefined;
+                reject(abortError(controller.signal));
+              };
+              wake = () => {
+                controller.signal.removeEventListener("abort", onAbort);
+                wake = undefined;
+                resolve();
+              };
+              controller.signal.addEventListener("abort", onAbort, { once: true });
+              if (controller.signal.aborted) onAbort();
+            });
+            continue;
+          }
+          const candidate = candidates[index++];
+          const patch = await fetch(session.signalingUrl, {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ sessionId: session.id, generation, candidate }),
+            signal: controller.signal,
+          });
+          if (patch.status !== 204) throw new Error(`ICE candidate HTTP error: ${patch.status}`);
+          if (candidate === null) return;
+        }
+      };
+      const download = async () => {
+        let cursor = 0;
+        while (true) {
+          const url = new URL(session.signalingUrl);
+          url.searchParams.set("sessionId", session.id);
+          url.searchParams.set("generation", generation);
+          url.searchParams.set("cursor", String(cursor));
+          const pageResponse = await fetch(url, { signal: controller.signal });
+          if (!pageResponse.ok) throw new Error(`ICE polling HTTP error: ${pageResponse.status}`);
+          const page: unknown = await pageResponse.json();
+          if (
+            !page ||
+            typeof page !== "object" ||
+            !("generation" in page) ||
+            page.generation !== generation ||
+            !("candidates" in page) ||
+            !Array.isArray(page.candidates) ||
+            !("next" in page) ||
+            !Number.isInteger(page.next) ||
+            page.next !== cursor + page.candidates.length ||
+            (page.next as number) > 256 ||
+            !page.candidates.every((candidate: unknown) => this.validTrickleCandidate(candidate)) ||
+            page.candidates.slice(0, -1).includes(null)
+          )
+            throw new Error("Signaling server returned an invalid ICE candidate page");
+          for (const candidate of page.candidates as (RTCIceCandidateInit | null)[]) {
+            await this.withDeadline(
+              pc.addIceCandidate(candidate),
+              this.iceGatheringTimeoutMs,
+              controller.signal,
+            );
+            if (candidate === null) return;
+          }
+          cursor = page.next as number;
+          if (!page.candidates.length)
+            await new Promise<void>((resolve, reject) => {
+              const timer = setTimeout(() => {
+                controller.signal.removeEventListener("abort", onAbort);
+                resolve();
+              }, 50);
+              const onAbort = () => {
+                clearTimeout(timer);
+                reject(abortError(controller.signal));
+              };
+              controller.signal.addEventListener("abort", onAbort, { once: true });
+              if (controller.signal.aborted) onAbort();
+            });
+        }
+      };
+      await Promise.all([
+        applying.then(() => {
+          if (!ended && !failure) {
+            if (candidates.length >= 256)
+              failure = new Error("Invalid or excessive local ICE candidates");
+            else {
+              candidates.push(null);
+              ended = true;
+            }
+            wake?.();
+          }
+        }),
+        upload(),
+        download(),
+      ]);
+    } finally {
+      controller.abort();
+      clearTimeout(timeout);
+      clearTimeout(pollTimer);
+      pc.removeEventListener("icecandidate", onCandidate);
+      signal?.removeEventListener("abort", abort);
+      if (session.trickleAbort === controller) delete session.trickleAbort;
+    }
+  }
+
+  private validTrickleCandidate(value: unknown): value is RTCIceCandidateInit | null {
+    if (value === null) return true;
+    if (!value || typeof value !== "object") return false;
+    const candidate = value as RTCIceCandidateInit;
+    return (
+      typeof candidate.candidate === "string" &&
+      candidate.candidate.length > 0 &&
+      candidate.candidate.length <= 4096 &&
+      (candidate.sdpMid == null ||
+        (typeof candidate.sdpMid === "string" && candidate.sdpMid.length <= 256)) &&
+      (candidate.sdpMLineIndex == null ||
+        (Number.isInteger(candidate.sdpMLineIndex) &&
+          candidate.sdpMLineIndex >= 0 &&
+          candidate.sdpMLineIndex <= 65535)) &&
+      (candidate.sdpMid != null || candidate.sdpMLineIndex != null) &&
+      (candidate.usernameFragment == null ||
+        (typeof candidate.usernameFragment === "string" &&
+          candidate.usernameFragment.length <= 256))
+    );
   }
 
   private async setRemoteDescription(
@@ -1059,6 +1467,7 @@ export class WebRtcTransport implements HyperTransport {
   private async disposeClientSession(session: ClientSession, notifyRemote: boolean): Promise<void> {
     if (session.closed) return;
     session.closed = true;
+    session.trickleAbort?.abort(new Error("WebRTC session closed"));
 
     if (this.sessions.get(session.peerUrl) === session) {
       this.sessions.delete(session.peerUrl);
@@ -1262,6 +1671,8 @@ export class WebRtcTransport implements HyperTransport {
     const session = this.serverSessions.get(sessionId);
     if (!session || session.closed) return Promise.resolve();
     session.closed = true;
+    session.trickle?.detach();
+    delete session.trickle;
     session.controller.abort();
     session.release();
     this.serverSessions.delete(sessionId);

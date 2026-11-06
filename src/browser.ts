@@ -13,6 +13,7 @@ export type WebRtcTransportRequest = TransportRequest & {
 
 export interface WebRtcTransportOptions {
   readonly iceServers?: RTCIceServer[];
+  readonly trickleIce?: boolean;
   readonly iceGatheringTimeoutMs?: number;
   readonly signalingTimeoutMs?: number;
   readonly connectionTimeoutMs?: number;
@@ -48,6 +49,7 @@ interface Session extends WebRtcSessionView {
   cleanup: (() => void)[];
   signaled: boolean;
   disposal?: Promise<void>;
+  exchange?: Promise<void>;
 }
 
 /** Browser client transport. Caller-owned local media tracks are never stopped. */
@@ -262,6 +264,8 @@ export class WebRtcTransport implements HyperTransport {
   }
 
   private async negotiate(session: Session, signal?: AbortSignal): Promise<void> {
+    if (session.exchange) await session.exchange;
+    if (this.options.trickleIce) return this.negotiateTrickle(session, signal);
     const pc = session.peerConnection;
     await this.run(
       session,
@@ -317,6 +321,219 @@ export class WebRtcTransport implements HyperTransport {
         if (active.aborted) throw abortError(active);
         await pc.setRemoteDescription({ type: "answer", sdp: answer.sdp });
       },
+    );
+  }
+
+  private async negotiateTrickle(session: Session, signal?: AbortSignal): Promise<void> {
+    const pc = session.peerConnection;
+    let ready!: () => void;
+    let fail!: (error: unknown) => void;
+    const established = new Promise<void>((resolve, reject) => {
+      ready = resolve;
+      fail = reject;
+    });
+    const exchange = this.run(
+      session,
+      undefined,
+      this.options.iceGatheringTimeoutMs ?? 10_000,
+      "Trickle ICE",
+      async (active) => {
+        const candidates: (RTCIceCandidateInit | null)[] = [];
+        let wake: (() => void) | undefined;
+        let ended = false;
+        let candidateError: Error | undefined;
+        const onCandidate = (event: RTCPeerConnectionIceEvent) => {
+          if (ended || active.aborted) return;
+          const candidate = event.candidate ? event.candidate.toJSON() : null;
+          if (candidate && candidate.candidate === "") return;
+          if (candidates.length >= 256 || !this.validCandidate(candidate)) {
+            candidateError = new Error("Invalid or excessive local ICE candidates");
+          } else {
+            candidates.push(candidate);
+            if (candidate === null) ended = true;
+          }
+          wake?.();
+        };
+        pc.addEventListener("icecandidate", onCandidate);
+        try {
+          const offer = await pc.createOffer();
+          if (active.aborted) throw abortError(active);
+          await pc.setLocalDescription(offer);
+          if (active.aborted) throw abortError(active);
+          if (pc.iceGatheringState === "complete" && !ended && !candidateError) {
+            if (candidates.length >= 256)
+              candidateError = new Error("Invalid or excessive local ICE candidates");
+            else {
+              candidates.push(null);
+              ended = true;
+            }
+          }
+          if (!pc.localDescription?.sdp) throw new Error("Local SDP offer was not generated");
+          session.signaled = true;
+          const response = await this.run(
+            session,
+            signal,
+            this.options.signalingTimeoutMs ?? 10_000,
+            "Signaling",
+            async (signaling) => {
+              const response = await fetch(session.signalingUrl, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                  sessionId: session.id,
+                  sdp: pc.localDescription,
+                  trickle: true,
+                }),
+                signal: signaling,
+              });
+              if (!response.ok)
+                throw new Error(`Signaling HTTP error: ${response.status} ${response.statusText}`);
+              return response.json() as Promise<unknown>;
+            },
+          );
+          const result: unknown = response;
+          if (
+            !result ||
+            typeof result !== "object" ||
+            !("generation" in result) ||
+            typeof result.generation !== "string" ||
+            !result.generation ||
+            result.generation.length > 256 ||
+            !("sdp" in result) ||
+            !result.sdp ||
+            typeof result.sdp !== "object" ||
+            !("type" in result.sdp) ||
+            result.sdp.type !== "answer" ||
+            !("sdp" in result.sdp) ||
+            typeof result.sdp.sdp !== "string" ||
+            !result.sdp.sdp
+          ) {
+            throw new Error("Signaling server returned an invalid trickle answer");
+          }
+          const generation = result.generation;
+          if (active.aborted) throw abortError(active);
+          await pc.setRemoteDescription({ type: "answer", sdp: result.sdp.sdp });
+          if (active.aborted) throw abortError(active);
+          ready();
+          const upload = async () => {
+            let index = 0;
+            while (true) {
+              if (active.aborted) throw abortError(active);
+              if (candidateError) throw candidateError;
+              if (index === candidates.length) {
+                await new Promise<void>((resolve, reject) => {
+                  const onAbort = () => {
+                    wake = undefined;
+                    reject(abortError(active));
+                  };
+                  wake = () => {
+                    active.removeEventListener("abort", onAbort);
+                    wake = undefined;
+                    resolve();
+                  };
+                  active.addEventListener("abort", onAbort, { once: true });
+                  if (active.aborted) onAbort();
+                });
+                continue;
+              }
+              const candidate = candidates[index++];
+              const patch = await fetch(session.signalingUrl, {
+                method: "PATCH",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ sessionId: session.id, generation, candidate }),
+                signal: active,
+              });
+              if (patch.status !== 204)
+                throw new Error(`ICE candidate HTTP error: ${patch.status}`);
+              if (candidate === null) return;
+            }
+          };
+          const download = async () => {
+            let cursor = 0;
+            while (true) {
+              if (active.aborted) throw abortError(active);
+              const url = new URL(session.signalingUrl);
+              url.searchParams.set("sessionId", session.id);
+              url.searchParams.set("generation", generation);
+              url.searchParams.set("cursor", String(cursor));
+              const response = await fetch(url, { signal: active });
+              if (!response.ok) throw new Error(`ICE polling HTTP error: ${response.status}`);
+              const page: unknown = await response.json();
+              if (
+                !page ||
+                typeof page !== "object" ||
+                !("generation" in page) ||
+                page.generation !== generation ||
+                !("candidates" in page) ||
+                !Array.isArray(page.candidates) ||
+                !("next" in page) ||
+                !Number.isInteger(page.next) ||
+                page.next !== cursor + page.candidates.length ||
+                (page.next as number) > 256 ||
+                !page.candidates.every((candidate: unknown) => this.validCandidate(candidate)) ||
+                page.candidates.slice(0, -1).includes(null)
+              ) {
+                throw new Error("Signaling server returned an invalid ICE candidate page");
+              }
+              for (const candidate of page.candidates as (RTCIceCandidateInit | null)[]) {
+                if (active.aborted) throw abortError(active);
+                await pc.addIceCandidate(candidate);
+                if (candidate === null) return;
+              }
+              cursor = page.next as number;
+              if (!page.candidates.length)
+                await new Promise<void>((resolve, reject) => {
+                  const timer = setTimeout(() => {
+                    active.removeEventListener("abort", onAbort);
+                    resolve();
+                  }, 50);
+                  const onAbort = () => {
+                    clearTimeout(timer);
+                    reject(abortError(active));
+                  };
+                  active.addEventListener("abort", onAbort, { once: true });
+                  if (active.aborted) onAbort();
+                });
+            }
+          };
+          await Promise.all([upload(), download()]);
+        } finally {
+          pc.removeEventListener("icecandidate", onCandidate);
+        }
+      },
+    );
+    session.exchange = exchange;
+    void exchange.then(
+      () => {
+        if (session.exchange === exchange) delete session.exchange;
+      },
+      (error: unknown) => {
+        fail(error);
+        if (session.exchange === exchange) delete session.exchange;
+        void this.dispose(session);
+      },
+    );
+    await this.abortable(established, signal);
+  }
+
+  private validCandidate(value: unknown): value is RTCIceCandidateInit | null {
+    if (value === null) return true;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const candidate = value as RTCIceCandidateInit;
+    return (
+      typeof candidate.candidate === "string" &&
+      candidate.candidate.length > 0 &&
+      candidate.candidate.length <= 4096 &&
+      (candidate.sdpMid == null ||
+        (typeof candidate.sdpMid === "string" && candidate.sdpMid.length <= 256)) &&
+      (candidate.sdpMLineIndex == null ||
+        (Number.isInteger(candidate.sdpMLineIndex) &&
+          candidate.sdpMLineIndex >= 0 &&
+          candidate.sdpMLineIndex <= 65535)) &&
+      (candidate.sdpMid != null || candidate.sdpMLineIndex != null) &&
+      (candidate.usernameFragment == null ||
+        (typeof candidate.usernameFragment === "string" &&
+          candidate.usernameFragment.length <= 256))
     );
   }
 
@@ -459,6 +676,7 @@ export class WebRtcTransport implements HyperTransport {
       if (controller.signal.aborted) throw abortError(controller.signal);
       return await this.abortable(task(controller.signal), controller.signal);
     } finally {
+      controller.abort();
       clearTimeout(timer);
       for (const source of sources) source.removeEventListener("abort", onAbort);
     }

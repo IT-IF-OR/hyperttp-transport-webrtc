@@ -5,6 +5,9 @@ export type {
   WebRtcServerSessionView,
 } from "./webrtc.js";
 export type {
+  WebRtcTrickleCandidate,
+  WebRtcTrickleAnswer,
+  WebRtcTrickleCandidates,
   WebRtcSessionView,
   WebRtcServerSessionContext,
   WebRtcServerSessionEvent,

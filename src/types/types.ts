@@ -77,6 +77,8 @@ export interface WebRtcServerSessionEvent extends WebRtcServerSessionContext {
 
 export interface WebRtcTransportOptions {
   readonly iceServers?: RTCIceServer[];
+  /** Enable incremental ICE signaling with a compatible server. Default: false. */
+  readonly trickleIce?: boolean;
   readonly iceGatheringTimeoutMs?: number;
   readonly signalingTimeoutMs?: number;
   readonly connectionTimeoutMs?: number;
@@ -113,11 +115,32 @@ export interface ClientSession {
   localTrackIds: Set<string>;
   pending: Map<string, PendingResponse>;
   negotiation: Promise<void>;
+  trickleAbort?: AbortController;
   closed: boolean;
   mediaController: WebRtcMediaController;
 }
 
+export type WebRtcTrickleCandidate = RTCIceCandidateInit | null;
+export interface WebRtcTrickleAnswer {
+  sdp: RTCSessionDescriptionInit;
+  generation: string;
+}
+export interface WebRtcTrickleCandidates {
+  generation: string;
+  candidates: WebRtcTrickleCandidate[];
+  next: number;
+}
+export interface ServerTrickleState {
+  generation: string;
+  candidates: WebRtcTrickleCandidate[];
+  gathering: boolean;
+  remoteCount: number;
+  remoteEnded: boolean;
+  remoteQueue: Promise<void>;
+  detach: () => void;
+}
 export interface ServerSession {
+  trickle?: ServerTrickleState;
   negotiating?: boolean;
   context: WebRtcServerSessionContext;
   controller: AbortController;

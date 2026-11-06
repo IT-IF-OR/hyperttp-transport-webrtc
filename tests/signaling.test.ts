@@ -145,12 +145,19 @@ describe("transport signaling options", () => {
         });
       },
     });
-    const response = fetch(`${url}/signal`, { method: "POST", body: offer });
+    // Isolate authorization shutdown from the HTTP client's keep-alive lifetime.
+    const response = fetch(`${url}/signal`, {
+      method: "POST",
+      body: offer,
+      headers: { connection: "close" },
+    });
     await started;
     const closing = server.close();
     expect(signal?.aborted).toBe(true);
     allow(true);
-    expect((await response).status).toBe(503);
+    const result = await response;
+    expect(result.status).toBe(503);
+    await result.arrayBuffer();
     await closing;
     expect(createPeerConnection).not.toHaveBeenCalled();
   });

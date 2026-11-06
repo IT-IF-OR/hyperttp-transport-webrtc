@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": true, "types": ["deno"] },
+  "files": ["src/browser.ts", "src/utils/helper.ts"],
+  "include": []
+}

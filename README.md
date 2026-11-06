@@ -110,7 +110,7 @@ Local browser mute/volume should not change the common source's volume.
 
 ## Deployment constraints
 
-- Signaling is non-trickle SDP over HTTP POST `/signal`; DELETE releases a session.
+- Signaling supports opt-in trickle ICE or the default full SDP exchange over HTTP POST `/signal`; DELETE releases a session.
 - `webrtc://` maps to HTTP, `webrtcs://` to HTTPS. Terminate TLS at a reverse proxy.
 - The built-in signaling server has no authentication, CORS policy, or session
   quotas. Use a same-origin authenticated gateway before exposing it publicly;
@@ -134,6 +134,16 @@ npm run build
 
 Network integration tests use loopback and no public STUN servers. PCM adapter
 integration tests require FFmpeg with libopus.
+
+Run `bun run typecheck:runtimes` for separate shared, Node, Bun and Deno type
+checks. Shared and Deno checks cover the browser-safe modules only; Node and Bun
+checks cover all source. Bun's types include Node compatibility types.
+Run `bun run test:node`, `bun run test:bun`, and `bun run test:deno` to execute
+Vitest in each actual runtime; `tests/runtime.test.ts` verifies which runtime is
+running. Deno requires `-A` for these tests, so only run trusted code. Chromium
+integration tests require `/usr/bin/chromium` or `PLAYWRIGHT_CHROMIUM_EXECUTABLE`
+and otherwise skip. The shutdown test launches the corresponding runtime in a
+separate process to check that WebRTC resources do not keep it alive.
 
 ## Integration boundaries
 
@@ -206,7 +216,16 @@ Use `closeServerSession(sessionId)` for idempotent application cleanup. The
 trusted authorization context and an abort signal. `WebRtcTransport.close()`
 closes all listener-owned sessions and emits the corresponding close events.
 
-The server currently supports **full-ICE-only signaling**. It gathers candidates
-before returning the SDP answer. Trickle ICE (`candidate` messages after the
-initial offer/answer) is not implemented; an ICE gathering timeout fails the
-signaling request rather than returning a partial answer.
+Without opting in, the server gathers all ICE candidates before returning its SDP
+answer. Gathering timeouts fail the request rather than returning a partial answer.
+
+### Opt-in server trickle ICE wire protocol
+
+The server supports trickle ICE on the configured signaling path (default `/signal`). The existing clients and `POST` without `trickle: true` are unchanged: they exchange a fully gathered SDP answer. Browser and Werift-based clients on Node.js, Bun and Deno can opt in with `new WebRtcTransport({ trickleIce: true })`. The Werift client currently waits for the candidate exchange to finish before completing negotiation.
+
+* `POST /signal` with JSON `{ "sessionId": "...", "sdp": { "type": "offer", "sdp": "..." }, "trickle": true }` returns `200` JSON `{ "sdp": { "type": "answer", "sdp": "..." }, "generation": "..." }` as soon as the local answer is available, potentially before gathering completes. Apply the answer before its candidates. The answer can already contain candidates.
+* `GET /signal?sessionId=...&generation=...&cursor=0` returns `200` JSON `{ "generation": "...", "candidates": [...], "next": 0 }`. Poll with the returned `next` cursor; it is an array index, and repeated requests at the same cursor replay the same entries. Each entry is an `RTCIceCandidateInit` or `null` (end of candidates). A response without `null` is not complete. The cursor defaults to `0`.
+* `PATCH /signal` with JSON `{ "sessionId": "...", "generation": "...", "candidate": ... }` applies one client `RTCIceCandidateInit` or `null` for end-of-candidates. A non-null candidate needs a nonempty `candidate` string and `sdpMid` or `sdpMLineIndex`. Success is `204`. Send candidates in order and await each response, including the final `null`.
+* `DELETE /signal?sessionId=...` closes the session as before. All operations pass through the configured authorization callback; GET and PATCH must have the same owner identity and listener as the session. Anonymous/boolean authorization retains its existing anonymous ownership semantics.
+
+Every accepted new offer invalidates the previous generation, including when switching back to legacy signaling. A new offer while negotiation or server ICE gathering is in progress returns `409`; stale or missing generations return `409`, unknown sessions `404`, owner mismatch `403`, and invalid payloads/cursors `400`. At most 256 entries (including end-of-candidates) are accepted per direction per generation; further client entries return `429`, and server overflow closes the session. Candidate strings are limited to 4096 characters, IDs to 256 characters, and request bodies to 1,000,000 bytes. Session closure, disconnection, failed gathering, and listener shutdown release generation state. Clients should stop polling after `null`, close unused sessions, and treat non-success responses as terminal or restart negotiation as appropriate.

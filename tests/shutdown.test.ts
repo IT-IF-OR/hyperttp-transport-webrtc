@@ -1,14 +1,14 @@
 import { execFile } from "node:child_process";
 import { createRequire } from "node:module";
-import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 import { build } from "esbuild";
 import { expect, it } from "vitest";
 
 it("exits naturally after closing a bundled audio and data-channel session", async () => {
   // A runner can hide leaked handles. Test shutdown in a separate process instead.
   const require = createRequire(import.meta.url);
-  const werift = pathToFileURL(require.resolve("werift")).href;
+  const werift = new URL("../../index.mjs", pathToFileURL(require.resolve("werift"))).href;
   const bundled = await build({
     entryPoints: ["src/webrtc.ts"],
     bundle: true,
@@ -49,7 +49,9 @@ it("exits naturally after closing a bundled audio and data-channel session", asy
   `;
   const { stdout } = await promisify(execFile)(
     process.execPath,
-    ["--input-type=module", "-e", script],
+    "Deno" in globalThis
+      ? ["eval", "--no-config", "--no-lock", "--node-modules-dir=manual", script]
+      : ["--input-type=module", "-e", script],
     {
       timeout: 25_000,
       maxBuffer: 1_000_000,
