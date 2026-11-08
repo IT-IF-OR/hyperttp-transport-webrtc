@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.1] - 2026-11-08
+
+### Added
+
+- Added the `realtime: false` PCM audio option for inputs that are already paced, avoiding FFmpeg's additional input rate limiter.
+- Added bounded RTP pacing based on 48 kHz timestamps, including timestamp wrap handling and explicit overflow and discontinuity errors.
+
+### Fixed
+
+- Prevented accumulated scheduling drift after event-loop stalls by recovering gradually without a catch-up burst.
+- Waited for queued RTP packets to be delivered before completing audio at EOF; explicit close still discards pending packets.
+
+### Notes
+
+- Producers using `realtime: false` must pace their input; sustained overload can overflow the bounded queue, and UDP packets may be dropped before reaching it.
+
 ## [0.4.0] - 2026-11-06
 
 ### Added

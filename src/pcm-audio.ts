@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createSocket } from "node:dgram";
 import { MediaStream, MediaStreamTrack, RtpPacket } from "werift";
+import { RtpPacer } from "./rtp-pacer.js";
 
 export interface PcmAudioSubscription {
   stream: MediaStream;
@@ -16,6 +17,8 @@ export interface PcmAudioSource {
 
 export interface PcmAudioOptions {
   ffmpegPath?: string;
+  /** Pace input with FFmpeg's -re (default: true). RTP is additionally paced when false. */
+  realtime?: boolean;
   signal?: AbortSignal;
 }
 
@@ -23,7 +26,7 @@ export interface PcmAudioOptions {
  * Optional server-only helper. Requires an external FFmpeg executable with libopus
  * on PATH (or ffmpegPath). Input is raw 48 kHz, stereo, signed 16-bit little-endian
  * PCM; chunk boundaries need not align to samples. One input/encoder is shared,
- * paced by FFmpeg's -re, with no replay for late subscribers. RTP/RTCP stays on
+ * paced by FFmpeg's -re by default, with no replay for late subscribers. RTP/RTCP stays on
  * IPv4 loopback. No peer connection or native wrtc dependency is created.
  *
  * Writes are bounded to 16 KiB, with one outstanding write and one input chunk.
@@ -63,7 +66,7 @@ export async function createPcmAudioSource(
       "-loglevel",
       "error",
       "-nostdin",
-      "-re",
+      ...(options.realtime === false ? [] : ["-re"]),
       "-f",
       "s16le",
       "-ar",
@@ -125,10 +128,28 @@ export async function createPcmAudioSource(
   }
   const childClosed = new Promise<void>((resolve) => child.once("close", () => resolve()));
   let cleanup: Promise<void> | undefined;
+  let encoderEnded = false;
+  let settleTimer: ReturnType<typeof setTimeout> | undefined;
+  const pacer =
+    options.realtime === false
+      ? new RtpPacer<RtpPacket>(
+          (packet) => {
+            for (const track of tracks) if (!track.stopped) track.writeRtp(packet);
+          },
+          (error) => {
+            void finish(error);
+          },
+          () => {
+            if (encoderEnded && settleTimer === undefined) void finish();
+          },
+        )
+      : undefined;
 
   function finish(error?: unknown): Promise<void> {
     if (cleanup) return cleanup;
     stopped = true;
+    if (settleTimer !== undefined) clearTimeout(settleTimer);
+    pacer?.stop();
     for (const cancel of pending) cancel();
     pending.clear();
     options.signal?.removeEventListener("abort", onAbort);
@@ -176,8 +197,17 @@ export async function createPcmAudioSource(
   });
   child.on("close", (code, signal) => {
     if (stopped) return;
-    if (code === 0 && inputEnded) void finish();
-    else void finish(new Error(`FFmpeg exited (${signal ?? code}): ${stderr.trim()}`));
+    if (code === 0 && inputEnded) {
+      if (!pacer) void finish();
+      else {
+        encoderEnded = true;
+        // UDP delivery can lag behind the child process close event.
+        settleTimer = setTimeout(() => {
+          settleTimer = undefined;
+          if (pacer.empty) void finish();
+        }, 50);
+      }
+    } else void finish(new Error(`FFmpeg exited (${signal ?? code}): ${stderr.trim()}`));
   });
   socket.on("message", (message, remote) => {
     if (stopped || remote.address !== "127.0.0.1" || message.length < 12) return;
@@ -190,9 +220,11 @@ export async function createPcmAudioSource(
       return;
     }
     if (packet.header.payloadType !== 111) return;
-    for (const track of tracks) {
-      if (!track.stopped) track.writeRtp(packet);
-    }
+    if (pacer) pacer.push(packet, packet.header.timestamp);
+    else
+      for (const track of tracks) {
+        if (!track.stopped) track.writeRtp(packet);
+      }
   });
   options.signal?.addEventListener("abort", onAbort, { once: true });
   if (options.signal?.aborted) onAbort();
@@ -221,7 +253,9 @@ export async function createPcmAudioSource(
         iterator = {
           next: async () => {
             const result = await reader.read();
-            return result.done ? { done: true, value: undefined } : { done: false, value: result.value };
+            return result.done
+              ? { done: true, value: undefined }
+              : { done: false, value: result.value };
           },
         };
         cancelInput = () => reader.cancel();

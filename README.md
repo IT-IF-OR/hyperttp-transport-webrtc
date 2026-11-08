@@ -48,6 +48,14 @@ implementation. It requires an installed FFmpeg executable with `libopus` suppor
 (`ffmpegPath` can override PATH). It encodes one shared PCM input to 20 ms Opus
 frames and delivers RTP to independent Werift tracks over IPv4 loopback UDP.
 It starts consuming immediately; late subscribers join the current position.
+By default FFmpeg's `-re` paces input at its nominal rate. For a live input that
+is already paced, use `createPcmAudioSource(pcmStream, { realtime: false })` to
+avoid this second limiter. RTP is paced using its 48 kHz timestamps, with a
+bounded queue of 100 packets. An unpaced producer can overflow that queue, in
+which case `audio.done` rejects; UDP itself can also drop packets before they
+reach the queue. Producers remain responsible for pacing and bounded buffering.
+After an input or event-loop pause, delivery resumes without a catch-up burst.
+At EOF, `done` waits for queued packets to be delivered; explicit close discards them.
 Observe `audio.done` for EOF/encoder/input errors. Close the adapter when its
 playback session ends. Closing a listener stops only its track, not the source.
 It does not implement seeking, playback pause, or audio mixing.

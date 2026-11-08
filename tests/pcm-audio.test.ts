@@ -1,5 +1,10 @@
-import { spawnSync } from "node:child_process";
-import { afterEach, describe, expect, it } from "vitest";
+import { spawn, spawnSync } from "node:child_process";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:child_process")>();
+  return { ...original, spawn: vi.fn(original.spawn) };
+});
 import type { MediaStreamTrack, RtpPacket } from "werift";
 import { createPcmAudioSource, type PcmAudioSource } from "../src/pcm-audio.js";
 
@@ -76,7 +81,57 @@ it("rejects missing FFmpeg executables without consuming input", async () => {
   expect(consumed).toBe(false);
 });
 
+it.each([
+  [undefined, true],
+  [true, true],
+  [false, false],
+])("passes -re according to realtime=%s", async (realtime, expected) => {
+  vi.mocked(spawn).mockClear();
+  const audio = await source(new ReadableStream<Uint8Array>(), { realtime });
+  const args = vi.mocked(spawn).mock.calls.at(-1)![1] as string[];
+  expect(args.includes("-re")).toBe(expected);
+  if (expected) expect(args.indexOf("-re")).toBeLessThan(args.indexOf("-i"));
+  await audio.close();
+});
+
 describe.skipIf(!hasFfmpeg)("PCM audio with real loopback FFmpeg/libopus", () => {
+  it("drains paced RTP before resolving EOF", async () => {
+    const audio = await source(
+      {
+        async *[Symbol.asyncIterator]() {
+          yield silence(20);
+        },
+      },
+      { realtime: false },
+    );
+    const received: number[] = [];
+    const track = audio.subscribe().stream.getAudioTracks()[0]!;
+    track.onReceiveRtp.subscribe(() => received.push(performance.now()));
+    await audio.done;
+    expect(received.length).toBeGreaterThanOrEqual(19);
+    expect(received.at(-1)! - received[0]!).toBeGreaterThan(300);
+    expect(track.stopped).toBe(true);
+  });
+
+  it("encodes an already paced live input without -re", async () => {
+    const audio = await source(
+      {
+        async *[Symbol.asyncIterator]() {
+          for (let i = 0; i < 30; i++) {
+            yield silence(1);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+        },
+      },
+      { realtime: false },
+    );
+    const received = await packets(audio.subscribe().stream.getAudioTracks()[0]!, 5);
+    expect(received.every((packet) => packet.header.payloadType === 111)).toBe(true);
+    for (let i = 1; i < received.length; i++) {
+      expect((received[i]!.header.timestamp - received[i - 1]!.header.timestamp) >>> 0).toBe(960);
+    }
+    await audio.done;
+  });
   it("consumes once, emits 20ms Opus RTP, and isolates subscriptions", async () => {
     let iterations = 0;
     const audio = await source({
