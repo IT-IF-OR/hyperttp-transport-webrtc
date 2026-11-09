@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.2] - 2026-11-10
+
+### Fixed
+
+- Return HTTP 400 for malformed signaling JSON and HTTP 500 for unexpected signaling failures instead of treating internal errors as invalid requests.
+- Avoid exposing exception messages in signaling error responses; unexpected errors remain available to the server logger.
+- Return the error response before closing a failed signaling session so cleanup does not replace its status.
+
 ## [0.4.1] - 2026-11-08
 
 ### Added

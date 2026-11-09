@@ -1,6 +1,7 @@
 import { createServer, request } from "node:http";
 import type { TransportRequest, TransportSignalingOptions } from "@hyperttp/types";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { RTCPeerConnection } from "werift";
 import { WebRtcTransport } from "../src/webrtc.js";
 
 const cleanup: Array<() => Promise<void>> = [];
@@ -35,6 +36,46 @@ async function start(signaling?: TransportSignalingOptions) {
 const offer = JSON.stringify({ sessionId: "test", sdp: { type: "offer", sdp: "test" } });
 
 describe("transport signaling options", () => {
+  it.each(["POST", "PATCH"])("returns a safe 400 for malformed %s JSON", async (method) => {
+    const { url, createPeerConnection } = await start();
+    const response = await fetch(`${url}/signal`, { method, body: '{"secret":' });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "Invalid JSON" });
+    expect(createPeerConnection).not.toHaveBeenCalled();
+  });
+
+  it.each(["null", "42", '"value"', "{}"])(
+    "rejects invalid POST payload %s before peer creation",
+    async (body) => {
+      const { url, createPeerConnection } = await start();
+      const response = await fetch(`${url}/signal`, { method: "POST", body });
+      expect(response.status).toBe(400);
+      expect(createPeerConnection).not.toHaveBeenCalled();
+    },
+  );
+
+  it("returns a generic 500 when peer creation fails", async () => {
+    const { url, createPeerConnection } = await start();
+    createPeerConnection.mockImplementation(() => { throw new Error("secret peer failure"); });
+    const response = await fetch(`${url}/signal`, { method: "POST", body: offer });
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: "Signaling failed" });
+  });
+
+  it("returns a generic 500 and closes the session when negotiation fails", async () => {
+    const { transport, url } = await start();
+    const peer = new RTCPeerConnection({ iceServers: [] });
+    const close = vi.spyOn(peer, "close");
+    vi.spyOn(peer, "setRemoteDescription").mockRejectedValue(new Error("secret SDP failure"));
+    vi.spyOn(transport as unknown as { createPeerConnection: () => RTCPeerConnection }, "createPeerConnection")
+      .mockReturnValue(peer);
+    const response = await fetch(`${url}/signal`, { method: "POST", body: offer });
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: "Signaling failed" });
+    await expect.poll(() => close.mock.calls.length).toBe(1);
+    expect(transport.getServerSession("test")).toBeUndefined();
+  });
+
   it("routes a custom path and preserves the default path", async () => {
     const authorize = vi.fn(() => true);
     const custom = await start({ path: "/rtc/signal", authorize });

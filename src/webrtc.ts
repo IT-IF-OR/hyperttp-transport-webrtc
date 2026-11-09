@@ -369,7 +369,22 @@ export class WebRtcTransport implements HyperTransport {
             }
           }
         } catch (error) {
-          sendJson(400, { error: errorFromUnknown(error, "Failed to read body").message });
+          this.log("error", "[WebRtcTransport Server] Failed to read signaling body:", error);
+          sendJson(500, { error: "Signaling failed" });
+          return;
+        }
+
+        let payload: {
+          sessionId?: unknown;
+          sdp?: RTCSessionDescriptionInit;
+          trickle?: unknown;
+          generation?: unknown;
+          candidate?: unknown;
+        };
+        try {
+          payload = JSON.parse(raw);
+        } catch {
+          sendJson(400, { error: "Invalid JSON" });
           return;
         }
 
@@ -377,17 +392,10 @@ export class WebRtcTransport implements HyperTransport {
         let session: ServerSession | undefined;
 
         try {
-          const payload = JSON.parse(raw) as {
-            sessionId?: unknown;
-            sdp?: RTCSessionDescriptionInit;
-            trickle?: unknown;
-            generation?: unknown;
-            candidate?: unknown;
-          };
-
           if (req.method === "PATCH") {
             if (
               !payload ||
+              typeof payload !== "object" ||
               typeof payload.sessionId !== "string" ||
               typeof payload.generation !== "string" ||
               !("candidate" in payload)
@@ -618,6 +626,7 @@ export class WebRtcTransport implements HyperTransport {
           );
         } catch (error) {
           this.log("error", "[WebRtcTransport Server] Ошибка сигнализации:", error);
+          sendJson(500, { error: "Signaling failed" });
           if (session) {
             await this.closeServerSession(session.id);
           } else if (pc) {
@@ -625,7 +634,6 @@ export class WebRtcTransport implements HyperTransport {
               await pc.close();
             } catch {}
           }
-          sendJson(400, { error: errorFromUnknown(error, "Signaling failed").message });
         }
       })();
     });
