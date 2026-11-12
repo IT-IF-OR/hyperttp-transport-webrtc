@@ -305,8 +305,10 @@ export class WebRtcTransport implements HyperTransport {
           body: JSON.stringify({ sessionId: session.id, sdp: pc.localDescription }),
           signal: active,
         });
-        if (!response.ok)
+        if (!response.ok) {
+          this.cancelResponseBody(response);
           throw new Error(`Signaling HTTP error: ${response.status} ${response.statusText}`);
+        }
         const answer: unknown = await response.json();
         if (
           !answer ||
@@ -386,8 +388,10 @@ export class WebRtcTransport implements HyperTransport {
                 }),
                 signal: signaling,
               });
-              if (!response.ok)
+              if (!response.ok) {
+                this.cancelResponseBody(response);
                 throw new Error(`Signaling HTTP error: ${response.status} ${response.statusText}`);
+              }
               return response.json() as Promise<unknown>;
             },
           );
@@ -443,8 +447,10 @@ export class WebRtcTransport implements HyperTransport {
                 body: JSON.stringify({ sessionId: session.id, generation, candidate }),
                 signal: active,
               });
-              if (patch.status !== 204)
+              if (patch.status !== 204) {
+                this.cancelResponseBody(patch);
                 throw new Error(`ICE candidate HTTP error: ${patch.status}`);
+              }
               if (candidate === null) return;
             }
           };
@@ -457,7 +463,10 @@ export class WebRtcTransport implements HyperTransport {
               url.searchParams.set("generation", generation);
               url.searchParams.set("cursor", String(cursor));
               const response = await fetch(url, { signal: active });
-              if (!response.ok) throw new Error(`ICE polling HTTP error: ${response.status}`);
+              if (!response.ok) {
+                this.cancelResponseBody(response);
+                throw new Error(`ICE polling HTTP error: ${response.status}`);
+              }
               const page: unknown = await response.json();
               if (
                 !page ||
@@ -617,6 +626,10 @@ export class WebRtcTransport implements HyperTransport {
     );
   }
 
+  private cancelResponseBody(response: Response): void {
+    void response.body?.cancel().catch(() => undefined);
+  }
+
   private dispose(session: Session): Promise<void> {
     if (session.disposal) return session.disposal;
     const disposal = Promise.resolve().then(async () => {
@@ -637,10 +650,11 @@ export class WebRtcTransport implements HyperTransport {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 2_000);
       try {
-        await this.abortable(
+        const response = await this.abortable(
           fetch(url, { method: "DELETE", signal: controller.signal }),
           controller.signal,
         );
+        this.cancelResponseBody(response);
       } catch {
         /* Remote cleanup is best effort. */
       } finally {

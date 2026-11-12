@@ -115,8 +115,10 @@ export interface ClientSession {
   localTrackIds: Set<string>;
   pending: Map<string, PendingResponse>;
   negotiation: Promise<void>;
+  controller?: AbortController;
   trickleAbort?: AbortController;
   closed: boolean;
+  trackEndedListenerCleanup: Set<() => void>;
   mediaController: WebRtcMediaController;
 }
 
@@ -154,6 +156,7 @@ export interface ServerSession {
   localStreamResolved: boolean;
   ownsLocalStream: boolean;
   closed: boolean;
+  peerListenerCleanup: Set<() => void>;
 }
 
 export interface RTCIceServer {

@@ -35,7 +35,10 @@ it("supports owner-scoped trickle generations and cleans up", async () => {
     await transport.listen({
       host: "127.0.0.1",
       port: address.port,
-      signaling: { path: "/signal", authorize: (req) => ({ ownerId: String(req.headers?.authorization) }) },
+      signaling: {
+        path: "/signal",
+        authorize: (req) => ({ ownerId: String(req.headers?.authorization) }),
+      },
     });
     await peer.setLocalDescription(await peer.createOffer());
     const response = await fetch(url, {

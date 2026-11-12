@@ -56,7 +56,9 @@ describe("transport signaling options", () => {
 
   it("returns a generic 500 when peer creation fails", async () => {
     const { url, createPeerConnection } = await start();
-    createPeerConnection.mockImplementation(() => { throw new Error("secret peer failure"); });
+    createPeerConnection.mockImplementation(() => {
+      throw new Error("secret peer failure");
+    });
     const response = await fetch(`${url}/signal`, { method: "POST", body: offer });
     expect(response.status).toBe(500);
     expect(await response.json()).toEqual({ error: "Signaling failed" });
@@ -67,8 +69,10 @@ describe("transport signaling options", () => {
     const peer = new RTCPeerConnection({ iceServers: [] });
     const close = vi.spyOn(peer, "close");
     vi.spyOn(peer, "setRemoteDescription").mockRejectedValue(new Error("secret SDP failure"));
-    vi.spyOn(transport as unknown as { createPeerConnection: () => RTCPeerConnection }, "createPeerConnection")
-      .mockReturnValue(peer);
+    vi.spyOn(
+      transport as unknown as { createPeerConnection: () => RTCPeerConnection },
+      "createPeerConnection",
+    ).mockReturnValue(peer);
     const response = await fetch(`${url}/signal`, { method: "POST", body: offer });
     expect(response.status).toBe(500);
     expect(await response.json()).toEqual({ error: "Signaling failed" });

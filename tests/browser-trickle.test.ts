@@ -54,6 +54,77 @@ function setup(trickleIce = true) {
 }
 afterEach(() => vi.unstubAllGlobals());
 
+function responseWithCancelableBody(status: number, statusText = "") {
+  const cancel = vi.fn();
+  return {
+    cancel,
+    response: new Response(new ReadableStream({ cancel }), { status, statusText }),
+  };
+}
+
+it("cancels failed trickle POST response bodies without replacing the HTTP error", async () => {
+  const { negotiate } = setup();
+  const { cancel, response } = responseWithCancelableBody(500, "Server Error");
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => response),
+  );
+
+  await expect(negotiate()).rejects.toThrow("Signaling HTTP error: 500 Server Error");
+  expect(cancel).toHaveBeenCalledOnce();
+});
+
+it("cancels failed trickle PATCH response bodies without replacing the HTTP error", async () => {
+  const { session, negotiate } = setup();
+  const { cancel, response } = responseWithCancelableBody(500);
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_url, init = {}) => {
+      if (init.method === "POST")
+        return Response.json({ generation: "g", sdp: { type: "answer", sdp: "answer" } });
+      if (init.method === "PATCH") return response;
+      return new Promise<Response>((_resolve, reject) =>
+        init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }),
+      );
+    }),
+  );
+
+  await negotiate();
+  await expect(session.exchange!).rejects.toThrow("ICE candidate HTTP error: 500");
+  expect(cancel).toHaveBeenCalledOnce();
+});
+
+it("cancels failed trickle GET response bodies without replacing the HTTP error", async () => {
+  const { session, negotiate } = setup();
+  const { cancel, response } = responseWithCancelableBody(500);
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_url, init = {}) => {
+      if (init.method === "POST")
+        return Response.json({ generation: "g", sdp: { type: "answer", sdp: "answer" } });
+      if (init.method === "PATCH") return new Response(null, { status: 204 });
+      return response;
+    }),
+  );
+
+  await negotiate();
+  await expect(session.exchange!).rejects.toThrow("ICE polling HTTP error: 500");
+  expect(cancel).toHaveBeenCalledOnce();
+});
+
+it("cancels DELETE response bodies during best-effort cleanup", async () => {
+  const { session } = setup();
+  const { cancel, response } = responseWithCancelableBody(500);
+  session.signaled = true;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => response),
+  );
+
+  await (new WebRtcTransport() as any).dispose(session);
+  expect(cancel).toHaveBeenCalledOnce();
+});
+
 it("exchanges candidates in order and applies the answer first", async () => {
   const { pc, session, negotiate } = setup();
   const patches: unknown[] = [];

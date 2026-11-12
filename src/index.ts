@@ -1,6 +1,9 @@
-export { WebRtcTransport } from "./webrtc.js";
+export { WebRtcTransport, createWebRtcSignalingHandler } from "./webrtc.js";
+export { createWebRtcRestSignalingHandler } from "./rest-signaling.js";
+export type { WebRtcRestSignalingRequest } from "./rest-signaling.js";
 export type {
   WebRtcTransportOptions,
+  WebRtcSignalingHandler,
   WebRtcTransportServer,
   WebRtcServerSessionView,
 } from "./webrtc.js";

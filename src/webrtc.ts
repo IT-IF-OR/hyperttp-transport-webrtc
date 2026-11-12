@@ -20,6 +20,7 @@ import {
 } from "./types/types.js";
 import { abortError, decodeWireBody, encodeWireBody, errorFromUnknown } from "./utils/helper.js";
 import { createServer, type Server as HttpServer } from "node:http";
+import type { Socket } from "node:net";
 import {
   MediaStream as WeriftMediaStream,
   RTCPeerConnection as WeriftPeerConnection,
@@ -64,6 +65,61 @@ function createWeriftPeerConnection(configuration: RTCConfiguration): WeriftPeer
   return new WeriftPeerConnection(config);
 }
 
+function cancelResponseBody(response: Response): void {
+  try {
+    void response.body?.cancel().catch(() => {});
+  } catch {}
+}
+
+function waitForLocalDescription(
+  pc: WeriftPeerConnection,
+  applying: Promise<unknown>,
+  state: "stable" | "have-local-offer",
+  type: "answer" | "offer",
+  timeoutMs: number,
+  signals: (AbortSignal | undefined)[],
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      pc.removeEventListener("signalingstatechange", check);
+      for (const signal of signals) signal?.removeEventListener("abort", onAbort);
+    };
+    const finish = (error?: unknown) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error !== undefined) reject(error);
+      else resolve();
+    };
+    const check = () => {
+      if (
+        pc.signalingState === state &&
+        pc.localDescription?.type === type &&
+        pc.localDescription.sdp
+      )
+        finish();
+    };
+    const onAbort = () => {
+      const signal = signals.find((item) => item?.aborted);
+      finish(signal ? abortError(signal) : new Error("WebRTC session closed"));
+    };
+    const timer = setTimeout(() => finish(new Error("Local SDP timed out")), timeoutMs);
+    pc.addEventListener("signalingstatechange", check);
+    for (const signal of signals) signal?.addEventListener("abort", onAbort, { once: true });
+    void applying.then(
+      () => {
+        check();
+        if (!settled) finish(new Error("Local SDP was not generated"));
+      },
+      (error: unknown) => finish(error ?? new Error("Local SDP failed")),
+    );
+    if (signals.some((signal) => signal?.aborted)) onAbort();
+    else check();
+  });
+}
+
 function createWeriftMediaStream(): WeriftMediaStream {
   return new WeriftMediaStream();
 }
@@ -85,6 +141,491 @@ export interface WebRtcTransportServer extends TransportServer {
   >;
 }
 
+export interface WebRtcSignalingHandler {
+  handle(request: TransportRequest): Promise<TransportResponse>;
+  close(): Promise<void>;
+  closeServerSession(sessionId: string): Promise<void>;
+}
+
+type SignalingTransport = {
+  readonly closing: boolean;
+  readonly serverSessions: Map<string, ServerSession>;
+  readonly closingServerSessions: Map<string, Promise<void>>;
+  readonly iceServers: RTCIceServer[];
+  readonly iceGatheringTimeoutMs: number;
+  readonly signalingTimeoutMs: number;
+  createPeerConnection(configuration: RTCConfiguration): WeriftPeerConnection;
+  createMediaStream(): WeriftMediaStream;
+  attachServerPeerEvents(
+    session: ServerSession,
+    onRequest: TransportListenOptions["onRequest"],
+  ): void;
+  emitServerSession(session: ServerSession, type: WebRtcServerSessionEvent["type"]): void;
+  attachConfiguredServerStream(session: ServerSession): Promise<void>;
+  setRemoteDescription(
+    pc: WeriftPeerConnection,
+    description: RTCSessionDescriptionInit,
+  ): Promise<void>;
+  withDeadline<T>(operation: Promise<T>, timeoutMs: number, signal?: AbortSignal): Promise<T>;
+  waitForIceGatheringComplete(
+    pc: WeriftPeerConnection,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<boolean>;
+  closeServerSession(sessionId: string): Promise<void>;
+  log(level: "error" | "warn", message: string, meta?: unknown): void;
+};
+
+function isSignalingPath(path: string): boolean {
+  return (
+    path.startsWith("/") &&
+    !path.startsWith("//") &&
+    !/[?#\\\s]/u.test(path) &&
+    Array.from(path).every((char) => {
+      const code = char.codePointAt(0)!;
+      return code > 0x1f && (code < 0x7f || code > 0x9f);
+    }) &&
+    new URL(path, "http://localhost").pathname === path
+  );
+}
+
+class WebRtcSignalingHandlerImpl implements WebRtcSignalingHandler {
+  private readonly ownedSessions = new Set<string>();
+  private readonly active = new Set<AbortController>();
+  private closed = false;
+  private closePromise?: Promise<void>;
+  constructor(
+    private readonly transport: WebRtcTransport,
+    private readonly options: TransportListenOptions,
+    private readonly onClose: () => void,
+  ) {}
+
+  private response(status: number, body?: unknown): TransportResponse {
+    return {
+      status,
+      headers:
+        body === undefined
+          ? {}
+          : { "content-type": "application/json", "cache-control": "no-store" },
+      body: body === undefined ? "" : JSON.stringify(body),
+    };
+  }
+  private async body(body: unknown, signal?: AbortSignal): Promise<string> {
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    const add = (value: unknown) => {
+      const bytes =
+        typeof value === "string"
+          ? new TextEncoder().encode(value)
+          : value instanceof Uint8Array
+            ? value
+            : new Uint8Array(value as ArrayBuffer);
+      size += bytes.byteLength;
+      if (size > MAX_SIGNALING_BODY_BYTES) throw new RangeError("body too large");
+      chunks.push(bytes);
+    };
+    if (body == null) return "";
+    if (typeof body === "string" || body instanceof Uint8Array || body instanceof ArrayBuffer)
+      add(body);
+    else if (Symbol.asyncIterator in Object(body)) {
+      for await (const chunk of body as AsyncIterable<unknown>) {
+        if (signal?.aborted) throw abortError(signal);
+        add(chunk);
+      }
+    } else add(JSON.stringify(body));
+    const result = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      result.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return new TextDecoder().decode(result);
+  }
+  async handle(request: TransportRequest): Promise<TransportResponse> {
+    const controller = new AbortController();
+    const abort = () => controller.abort(request.signal?.reason);
+    request.signal?.addEventListener("abort", abort, { once: true });
+    if (request.signal?.aborted) abort();
+    this.active.add(controller);
+    if (this.closed) controller.abort();
+    try {
+      return await this.dispatch({ ...request, signal: controller.signal });
+    } finally {
+      this.active.delete(controller);
+      request.signal?.removeEventListener("abort", abort);
+    }
+  }
+
+  private async dispatch(request: TransportRequest): Promise<TransportResponse> {
+    if (this.closed || (this.transport as unknown as SignalingTransport).closing)
+      return this.response(503, { error: "WebRTC server is closing" });
+    if (request.signal?.aborted)
+      return this.response(503, { error: "WebRTC signaling request aborted" });
+    let url: URL;
+    try {
+      url = new URL(request.url, "http://localhost");
+    } catch {
+      return this.response(400, { error: "Invalid request URL" });
+    }
+    const path = this.options.signaling?.path ?? "/signal";
+    if (url.pathname !== path) return this.response(404, { error: "Signaling endpoint not found" });
+    let ownerId: string | undefined;
+    let authorization: unknown;
+    if (
+      ["POST", "DELETE", "GET", "PATCH"].includes(request.method) &&
+      this.options.signaling?.authorize
+    ) {
+      const controller = new AbortController();
+      const abort = () => controller.abort(request.signal?.reason);
+      request.signal?.addEventListener("abort", abort, { once: true });
+      this.active.add(controller);
+      try {
+        const allowed = await this.options.signaling.authorize({
+          protocol: "webrtc",
+          method: request.method,
+          url: request.url,
+          headers: request.headers,
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted || this.closed)
+          return this.response(503, { error: "WebRTC signaling request aborted" });
+        if (typeof allowed === "object" && allowed !== null) {
+          if (typeof allowed.ownerId !== "string" || !allowed.ownerId.trim())
+            return this.response(403, { error: "Invalid signaling identity" });
+          ownerId = allowed.ownerId;
+          authorization = allowed.context;
+        } else if (allowed !== true) return this.response(403, { error: "Signaling forbidden" });
+      } catch {
+        if (controller.signal.aborted || this.closed)
+          return this.response(503, { error: "WebRTC signaling request aborted" });
+        return this.response(403, { error: "Signaling forbidden" });
+      } finally {
+        this.active.delete(controller);
+        request.signal?.removeEventListener("abort", abort);
+      }
+    }
+    const transport = this.transport as unknown as SignalingTransport;
+    if (request.method === "DELETE") {
+      const id = url.searchParams.get("sessionId");
+      const session = id ? transport.serverSessions.get(id) : undefined;
+      if (session && (!this.ownedSessions.has(id!) || session.context.ownerId !== ownerId))
+        return this.response(403, { error: "Signaling forbidden" });
+      if (id && this.ownedSessions.has(id)) await transport.closeServerSession(id);
+      this.ownedSessions.delete(id!);
+      return this.response(204);
+    }
+    if (request.method === "GET") {
+      const id = url.searchParams.get("sessionId");
+      const session = id ? transport.serverSessions.get(id) : undefined;
+      if (!id || !session || !this.ownedSessions.has(id))
+        return this.response(404, { error: "Session not found" });
+      if (session.context.ownerId !== ownerId)
+        return this.response(403, { error: "Signaling forbidden" });
+      const state = session.trickle;
+      if (!state || url.searchParams.get("generation") !== state.generation)
+        return this.response(409, { error: "ICE generation mismatch" });
+      const cursor = url.searchParams.get("cursor") ?? "0";
+      if (
+        !/^(0|[1-9][0-9]*)$/.test(cursor) ||
+        !Number.isSafeInteger(Number(cursor)) ||
+        Number(cursor) > state.candidates.length
+      )
+        return this.response(400, { error: "Invalid ICE cursor" });
+      return this.response(200, {
+        generation: state.generation,
+        candidates: state.candidates.slice(Number(cursor)),
+        next: state.candidates.length,
+      });
+    }
+    if (request.method !== "POST" && request.method !== "PATCH")
+      return this.response(405, { error: "Method not allowed" });
+    let payload: unknown;
+    try {
+      payload = JSON.parse(await this.body(request.body, request.signal));
+    } catch (error) {
+      return error instanceof RangeError
+        ? this.response(413, { error: "Signaling payload too large" })
+        : this.response(400, { error: "Invalid JSON" });
+    }
+    if (request.signal?.aborted || this.closed)
+      return this.response(503, { error: "WebRTC signaling request aborted" });
+    if (request.method === "PATCH") return this.patch(payload, ownerId, request.signal);
+    return this.offer(payload, ownerId, authorization, request.signal);
+  }
+  private async patch(
+    payload: unknown,
+    ownerId: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<TransportResponse> {
+    const transport = this.transport as unknown as SignalingTransport;
+    const rawPayload = payload as {
+      sessionId?: unknown;
+      generation?: unknown;
+      candidate?: unknown;
+    };
+    if (
+      typeof rawPayload.sessionId !== "string" ||
+      typeof rawPayload.generation !== "string" ||
+      !("candidate" in rawPayload)
+    )
+      return this.response(400, { error: "Expected sessionId, generation and candidate" });
+    const candidatePayload = payload as {
+      sessionId: string;
+      generation: string;
+      candidate: unknown;
+    };
+    const session = transport.serverSessions.get(candidatePayload.sessionId);
+    if (!session || !this.ownedSessions.has(candidatePayload.sessionId))
+      return this.response(404, { error: "Session not found" });
+    if (session.context.ownerId !== ownerId)
+      return this.response(403, { error: "Signaling forbidden" });
+    const state = session.trickle;
+    if (!state || state.generation !== candidatePayload.generation)
+      return this.response(409, { error: "ICE generation mismatch" });
+    const candidate = candidatePayload.candidate as {
+      candidate?: unknown;
+      sdpMid?: unknown;
+      sdpMLineIndex?: unknown;
+      usernameFragment?: unknown;
+    } | null;
+    if (
+      candidate !== null &&
+      (typeof candidate !== "object" ||
+        typeof candidate.candidate !== "string" ||
+        candidate.candidate.length < 1 ||
+        candidate.candidate.length > 4096 ||
+        (candidate.sdpMid != null &&
+          (typeof candidate.sdpMid !== "string" || candidate.sdpMid.length > 256)) ||
+        (candidate.sdpMLineIndex != null &&
+          (!Number.isInteger(candidate.sdpMLineIndex) ||
+            (candidate.sdpMLineIndex as number) < 0 ||
+            (candidate.sdpMLineIndex as number) > 65535)) ||
+        (candidate.sdpMid == null && candidate.sdpMLineIndex == null) ||
+        (candidate.usernameFragment != null &&
+          (typeof candidate.usernameFragment !== "string" ||
+            candidate.usernameFragment.length > 256)))
+    )
+      return this.response(400, { error: "Invalid ICE candidate" });
+    if (state.remoteEnded || state.remoteCount >= 256)
+      return this.response(429, { error: "ICE candidate limit reached or gathering ended" });
+    state.remoteCount++;
+    if (candidate === null) state.remoteEnded = true;
+    const iceCandidate = candidate as RTCIceCandidateInit | null;
+    const operationSignal = signal
+      ? AbortSignal.any([signal, session.controller.signal])
+      : session.controller.signal;
+    if (operationSignal.aborted)
+      return this.response(503, { error: "WebRTC signaling request aborted" });
+    const apply = state.remoteQueue.then(async () => {
+      if (session.closed || session.trickle !== state) throw new Error("ICE generation expired");
+      await transport.withDeadline(
+        session.peerConnection.addIceCandidate(iceCandidate),
+        transport.iceGatheringTimeoutMs,
+        operationSignal,
+      );
+      if (operationSignal.aborted || session.closed || session.trickle !== state)
+        throw new Error("ICE generation expired");
+    });
+    state.remoteQueue = apply.catch(() => {});
+    try {
+      await apply;
+      return operationSignal.aborted || session.closed || session.trickle !== state
+        ? this.response(503, { error: "WebRTC signaling request aborted" })
+        : this.response(204);
+    } catch {
+      return operationSignal.aborted || session.closed
+        ? this.response(503, { error: "WebRTC signaling request aborted" })
+        : this.response(400, { error: "Failed to apply ICE candidate" });
+    }
+  }
+  private async offer(
+    payload: unknown,
+    ownerId: string | undefined,
+    authorization: unknown,
+    signal?: AbortSignal,
+  ): Promise<TransportResponse> {
+    const t = this.transport as unknown as SignalingTransport;
+    if (
+      !payload ||
+      typeof payload !== "object" ||
+      ("trickle" in payload &&
+        payload.trickle !== undefined &&
+        typeof payload.trickle !== "boolean")
+    )
+      return this.response(400, { error: "Invalid trickle flag" });
+    const offerPayload = payload as {
+      trickle?: boolean;
+      sessionId: unknown;
+      sdp?: { type?: unknown; sdp?: unknown };
+    };
+    if (
+      typeof offerPayload.sessionId !== "string" ||
+      offerPayload.sessionId.length < 1 ||
+      offerPayload.sessionId.length > 200 ||
+      offerPayload.sdp?.type !== "offer" ||
+      typeof offerPayload.sdp.sdp !== "string"
+    )
+      return this.response(400, { error: "Expected sessionId and a valid SDP offer" });
+    const id = offerPayload.sessionId;
+    let session = t.serverSessions.get(id);
+    let pc: any;
+    try {
+      if (session && !this.ownedSessions.has(id))
+        return this.response(409, { error: "Session belongs to another listener" });
+      if (session && session.context.ownerId !== ownerId)
+        return this.response(403, { error: "Signaling forbidden" });
+      if (t.closingServerSessions.has(id))
+        return this.response(409, { error: "Session is closing" });
+      if (session?.negotiating || session?.trickle?.gathering)
+        return this.response(409, { error: "Session negotiation already in progress" });
+      if (!session || session.closed) {
+        pc = t.createPeerConnection({ iceServers: t.iceServers });
+        const controller = new AbortController();
+        session = {
+          controller,
+          context: Object.freeze({
+            sessionId: id,
+            ownerId,
+            authorization,
+            signal: controller.signal,
+          }),
+          release: () => this.ownedSessions.delete(id),
+          id,
+          peerConnection: pc,
+          remoteStream: t.createMediaStream(),
+          localTrackIds: new Set<string>(),
+          localStreamResolved: false,
+          ownsLocalStream: false,
+          closed: false,
+          peerListenerCleanup: new Set<() => void>(),
+        };
+        this.ownedSessions.add(id);
+        t.serverSessions.set(id, session);
+        t.attachServerPeerEvents(session, this.options.onRequest);
+        t.emitServerSession(session, "created");
+      } else pc = session.peerConnection;
+      session.trickle?.detach();
+      delete session.trickle;
+      session.negotiating = true;
+      const operationSignal = signal
+        ? AbortSignal.any([signal, session.controller.signal])
+        : session.controller.signal;
+      await t.withDeadline(
+        t.setRemoteDescription(pc, offerPayload.sdp as RTCSessionDescriptionInit),
+        t.signalingTimeoutMs,
+        operationSignal,
+      );
+      await t.withDeadline(
+        t.attachConfiguredServerStream(session),
+        t.signalingTimeoutMs,
+        operationSignal,
+      );
+      if (operationSignal.aborted || this.closed || session.closed)
+        throw new Error("WebRTC session closed");
+      const answer = await t.withDeadline(pc.createAnswer(), t.signalingTimeoutMs, operationSignal);
+      const activeSession = session;
+      if (offerPayload.trickle === true) {
+        let state: ServerTrickleState | undefined;
+        const onCandidate = (event: { candidate?: { toJSON(): RTCIceCandidateInit } }) => {
+          if (
+            !state ||
+            activeSession.closed ||
+            activeSession.trickle !== state ||
+            t.serverSessions.get(id) !== activeSession
+          )
+            return;
+          if (state.candidates.length >= 256) {
+            void t.closeServerSession(id);
+            return;
+          }
+          state.candidates.push(event.candidate ? event.candidate.toJSON() : null);
+        };
+        pc.addEventListener("icecandidate", onCandidate);
+        state = {
+          generation: crypto.randomUUID(),
+          candidates: [],
+          gathering: true,
+          remoteCount: 0,
+          remoteEnded: false,
+          remoteQueue: Promise.resolve(),
+          detach: () => pc.removeEventListener("icecandidate", onCandidate),
+        };
+        activeSession.trickle = state;
+        const applying = t.withDeadline(
+          pc.setLocalDescription(answer),
+          t.iceGatheringTimeoutMs,
+          operationSignal,
+        );
+        void applying.then(
+          () => {
+            if (activeSession.trickle === state) {
+              state.gathering = false;
+              if (!state.candidates.includes(null)) state.candidates.push(null);
+            }
+          },
+          () => {
+            if (activeSession.trickle === state && t.serverSessions.get(id) === activeSession)
+              void t.closeServerSession(id);
+          },
+        );
+        await waitForLocalDescription(pc, applying, "stable", "answer", t.iceGatheringTimeoutMs, [
+          operationSignal,
+        ]);
+        if (operationSignal.aborted || this.closed || activeSession.closed)
+          throw new Error("WebRTC session closed");
+        activeSession.negotiating = false;
+        return this.response(200, { sdp: pc.localDescription, generation: state.generation });
+      }
+      await t.withDeadline(
+        pc.setLocalDescription(answer),
+        t.iceGatheringTimeoutMs,
+        operationSignal,
+      );
+      if (!(await t.waitForIceGatheringComplete(pc, t.iceGatheringTimeoutMs, operationSignal)))
+        throw new Error("Full ICE gathering timed out; trickle ICE is not supported");
+      if (operationSignal.aborted || this.closed || session.closed)
+        throw new Error("WebRTC session closed");
+      if (!pc.localDescription?.sdp || pc.localDescription.type !== "answer")
+        throw new Error("Local SDP answer was not generated");
+      session.negotiating = false;
+      return this.response(200, pc.localDescription);
+    } catch (error) {
+      const cancelled = signal?.aborted || this.closed || session?.closed;
+      t.log("error", "[WebRtcTransport Server] Signaling failed", error);
+      if (session && t.serverSessions.get(session.id) === session)
+        await t.closeServerSession(session.id);
+      else if (!session && pc) await pc.close().catch(() => {});
+      return cancelled
+        ? this.response(503, { error: "WebRTC session closed" })
+        : this.response(500, { error: "Signaling failed" });
+    }
+  }
+  async closeServerSession(id: string): Promise<void> {
+    if (this.ownedSessions.has(id)) {
+      await (this.transport as any).closeServerSession(id);
+      this.ownedSessions.delete(id);
+    }
+  }
+  async close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closed = true;
+    for (const controller of this.active) controller.abort();
+    this.closePromise = Promise.all(
+      [...this.ownedSessions].map((id) => this.closeServerSession(id)),
+    )
+      .then(() => undefined)
+      .finally(this.onClose);
+    return this.closePromise;
+  }
+}
+
+export function createWebRtcSignalingHandler(
+  transport: WebRtcTransport,
+  options: TransportListenOptions,
+): WebRtcSignalingHandler {
+  return transport.createSignalingHandler(options);
+}
+
 export class WebRtcTransport implements HyperTransport {
   private readonly sessions = new Map<string, ClientSession>();
   private readonly connecting = new Map<string, Promise<ClientSession>>();
@@ -93,9 +634,12 @@ export class WebRtcTransport implements HyperTransport {
   private readonly closingServerSessions = new Map<string, Promise<void>>();
   private readonly trackListeners = new Set<(event: WebRtcTrackEvent) => void>();
   private readonly serverClosers = new Set<() => Promise<void>>();
+  private readonly pendingServerStarts = new Set<Promise<void>>();
+  private readonly signalingHandlers = new Set<WebRtcSignalingHandler>();
   private requestSequence = 0;
   private closing = false;
   private readonly pendingPeers = new Set<WeriftPeerConnection>();
+  private readonly pendingClientControllers = new Map<WeriftPeerConnection, AbortController>();
   private readonly iceServers: RTCIceServer[];
   private readonly iceGatheringTimeoutMs: number;
   private readonly signalingTimeoutMs: number;
@@ -191,519 +735,165 @@ export class WebRtcTransport implements HyperTransport {
     return this.sendRequest(session, request, rtcRequest.timeout);
   }
 
-  public async listen(options: TransportListenOptions): Promise<WebRtcTransportServer> {
+  public createSignalingHandler(options: TransportListenOptions): WebRtcSignalingHandler {
     if (this.closing) throw new Error("WebRTC transport is closed");
-    const ownedSessions = new Set<string>();
-    const port = options.port ?? 3000;
-    const host = options.host ?? "127.0.0.1";
-    const signalingPath = options.signaling?.path ?? "/signal";
-    if (
-      !signalingPath.startsWith("/") ||
-      signalingPath.startsWith("//") ||
-      /[?#\\\s]/u.test(signalingPath) ||
-      Array.from(signalingPath).some((char) => {
-        const code = char.codePointAt(0)!;
-        return code <= 0x1f || (code >= 0x7f && code <= 0x9f);
-      }) ||
-      new URL(signalingPath, "http://localhost").pathname !== signalingPath
-    ) {
+    if (options.signal?.aborted) throw new Error("WebRtcTransport: server startup aborted");
+    if (!isSignalingPath(options.signaling?.path ?? "/signal")) {
       throw new TypeError(
         "WebRTC signaling path must be an absolute literal pathname without query or fragment",
       );
     }
+    let handler!: WebRtcSignalingHandler;
+    handler = new WebRtcSignalingHandlerImpl(this, options, () =>
+      this.signalingHandlers.delete(handler),
+    );
+    this.signalingHandlers.add(handler);
+    return handler;
+  }
 
-    if (options.signal?.aborted) {
-      throw new Error("WebRtcTransport: server startup aborted");
-    }
-
-    let closed = false;
-    let closePromise: Promise<void> | undefined;
-    const pendingAuthorizations = new Set<AbortController>();
-
-    const httpServer: HttpServer = createServer((req, res) => {
-      void (async () => {
-        const sendJson = (status: number, body: unknown) => {
-          if (res.headersSent || res.destroyed) return;
-          res.writeHead(status, {
-            "content-type": "application/json",
-            "cache-control": "no-store",
-          });
-          res.end(JSON.stringify(body));
-        };
-
-        if (closed || this.closing) {
-          sendJson(503, { error: "WebRTC server is closing" });
-          return;
-        }
-
-        let parsedUrl: URL;
-        try {
-          parsedUrl = new URL(req.url ?? "/", "http://localhost");
-        } catch {
-          sendJson(400, { error: "Invalid request URL" });
-          return;
-        }
-
-        if (parsedUrl.pathname !== signalingPath) {
-          sendJson(404, { error: "Signaling endpoint not found" });
-          return;
-        }
-
-        let ownerId: string | undefined;
-        let authorization: unknown;
-        if (
-          ["POST", "DELETE", "GET", "PATCH"].includes(req.method ?? "") &&
-          options.signaling?.authorize
-        ) {
-          const controller = new AbortController();
-          const onDisconnect = () => controller.abort();
-          const onAuthorizationAbort = () => {
-            sendJson(503, { error: "WebRTC signaling request aborted" });
-          };
-          req.once("aborted", onDisconnect);
-          res.once("close", onDisconnect);
-          controller.signal.addEventListener("abort", onAuthorizationAbort, { once: true });
-          pendingAuthorizations.add(controller);
-          try {
-            const headers: Record<string, string | string[]> = {};
-            for (const [name, value] of Object.entries(req.headers)) {
-              if (value !== undefined) headers[name] = value;
-            }
-            const allowed = await options.signaling.authorize({
-              protocol: "webrtc",
-              method: req.method!,
-              url: req.url ?? "/",
-              headers,
-              signal: controller.signal,
-            });
-            if (controller.signal.aborted || req.aborted || res.destroyed) return;
-            if (closed || this.closing || options.signal?.aborted) {
-              sendJson(503, { error: "WebRTC server is closing" });
-              return;
-            }
-            if (typeof allowed === "object" && allowed !== null) {
-              if (typeof allowed.ownerId !== "string" || !allowed.ownerId.trim()) {
-                sendJson(403, { error: "Invalid signaling identity" });
-                return;
-              }
-              ownerId = allowed.ownerId;
-              authorization = allowed.context;
-            } else if (allowed !== true) {
-              sendJson(403, { error: "Signaling forbidden" });
-              return;
-            }
-          } catch {
-            sendJson(403, { error: "Signaling forbidden" });
-            return;
-          } finally {
-            pendingAuthorizations.delete(controller);
-            req.off("aborted", onDisconnect);
-            res.off("close", onDisconnect);
-            controller.signal.removeEventListener("abort", onAuthorizationAbort);
-          }
-        }
-
-        if (req.method === "DELETE") {
-          const sessionId = parsedUrl.searchParams.get("sessionId");
-          const existing = sessionId ? this.serverSessions.get(sessionId) : undefined;
-          if (
-            existing &&
-            (!ownedSessions.has(sessionId!) || existing.context.ownerId !== ownerId)
-          ) {
-            sendJson(403, { error: "Signaling forbidden" });
-            return;
-          }
-          if (sessionId && ownedSessions.has(sessionId)) {
-            await this.closeServerSession(sessionId);
-            ownedSessions.delete(sessionId);
-          }
-          res.writeHead(204).end();
-          return;
-        }
-
-        if (req.method === "GET") {
-          const id = parsedUrl.searchParams.get("sessionId");
-          const session = id ? this.serverSessions.get(id) : undefined;
-          if (!session || !id || !ownedSessions.has(id)) {
-            sendJson(404, { error: "Session not found" });
-            return;
-          }
-          if (session.context.ownerId !== ownerId) {
-            sendJson(403, { error: "Signaling forbidden" });
-            return;
-          }
-          const state = session.trickle;
-          if (!state || parsedUrl.searchParams.get("generation") !== state.generation) {
-            sendJson(409, { error: "ICE generation mismatch" });
-            return;
-          }
-          const cursor = parsedUrl.searchParams.get("cursor") ?? "0";
-          if (
-            !/^(0|[1-9][0-9]*)$/.test(cursor) ||
-            !Number.isSafeInteger(Number(cursor)) ||
-            Number(cursor) > state.candidates.length
-          ) {
-            sendJson(400, { error: "Invalid ICE cursor" });
-            return;
-          }
-          sendJson(200, {
-            generation: state.generation,
-            candidates: state.candidates.slice(Number(cursor)),
-            next: state.candidates.length,
-          });
-          return;
-        }
-
-        if (req.method !== "POST" && req.method !== "PATCH") {
-          sendJson(405, { error: "Method not allowed" });
-          return;
-        }
-
-        let raw = "";
-        try {
-          for await (const chunk of req) {
-            raw += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
-            if (Buffer.byteLength(raw, "utf8") > MAX_SIGNALING_BODY_BYTES) {
-              sendJson(413, { error: "Signaling payload too large" });
-              return;
-            }
-          }
-        } catch (error) {
-          this.log("error", "[WebRtcTransport Server] Failed to read signaling body:", error);
-          sendJson(500, { error: "Signaling failed" });
-          return;
-        }
-
-        let payload: {
-          sessionId?: unknown;
-          sdp?: RTCSessionDescriptionInit;
-          trickle?: unknown;
-          generation?: unknown;
-          candidate?: unknown;
-        };
-        try {
-          payload = JSON.parse(raw);
-        } catch {
-          sendJson(400, { error: "Invalid JSON" });
-          return;
-        }
-
-        let pc: WeriftPeerConnection | undefined;
-        let session: ServerSession | undefined;
-
-        try {
-          if (req.method === "PATCH") {
-            if (
-              !payload ||
-              typeof payload !== "object" ||
-              typeof payload.sessionId !== "string" ||
-              typeof payload.generation !== "string" ||
-              !("candidate" in payload)
-            ) {
-              sendJson(400, { error: "Expected sessionId, generation and candidate" });
-              return;
-            }
-            const target = this.serverSessions.get(payload.sessionId);
-            if (!target || !ownedSessions.has(payload.sessionId)) {
-              sendJson(404, { error: "Session not found" });
-              return;
-            }
-            if (target.context.ownerId !== ownerId) {
-              sendJson(403, { error: "Signaling forbidden" });
-              return;
-            }
-            const state = target.trickle;
-            if (!state || state.generation !== payload.generation) {
-              sendJson(409, { error: "ICE generation mismatch" });
-              return;
-            }
-            const candidate = payload.candidate as RTCIceCandidateInit | null;
-            if (
-              candidate !== null &&
-              (typeof candidate !== "object" ||
-                typeof candidate.candidate !== "string" ||
-                candidate.candidate.length < 1 ||
-                candidate.candidate.length > 4096 ||
-                (candidate.sdpMid != null &&
-                  (typeof candidate.sdpMid !== "string" || candidate.sdpMid.length > 256)) ||
-                (candidate.sdpMLineIndex != null &&
-                  (!Number.isInteger(candidate.sdpMLineIndex) ||
-                    candidate.sdpMLineIndex < 0 ||
-                    candidate.sdpMLineIndex > 65535)) ||
-                (candidate.sdpMid == null && candidate.sdpMLineIndex == null) ||
-                (candidate.usernameFragment != null &&
-                  (typeof candidate.usernameFragment !== "string" ||
-                    candidate.usernameFragment.length > 256)))
-            ) {
-              sendJson(400, { error: "Invalid ICE candidate" });
-              return;
-            }
-            if (state.remoteEnded || state.remoteCount >= 256) {
-              sendJson(429, { error: "ICE candidate limit reached or gathering ended" });
-              return;
-            }
-            state.remoteCount++;
-            if (candidate === null) state.remoteEnded = true;
-            const apply = state.remoteQueue.then(async () => {
-              if (target.closed || target.trickle !== state)
-                throw new Error("ICE generation expired");
-              await target.peerConnection.addIceCandidate(candidate);
-            });
-            state.remoteQueue = apply.catch(() => {});
-            try {
-              await apply;
-              res.writeHead(204).end();
-            } catch {
-              sendJson(400, { error: "Failed to apply ICE candidate" });
-            }
-            return;
-          }
-          if (!payload || (payload.trickle !== undefined && typeof payload.trickle !== "boolean")) {
-            sendJson(400, { error: "Invalid trickle flag" });
-            return;
-          }
-          if (
-            typeof payload.sessionId !== "string" ||
-            payload.sessionId.length < 1 ||
-            payload.sessionId.length > 200 ||
-            payload.sdp?.type !== "offer" ||
-            typeof payload.sdp.sdp !== "string"
-          ) {
-            sendJson(400, { error: "Expected sessionId and a valid SDP offer" });
-            return;
-          }
-
-          if (closed || this.closing || options.signal?.aborted || req.aborted || res.destroyed) {
-            throw new Error("WebRTC signaling request aborted");
-          }
-          const sessionId = payload.sessionId;
-          session = this.serverSessions.get(sessionId);
-          if (session && !ownedSessions.has(sessionId)) {
-            sendJson(409, { error: "Session belongs to another listener" });
-            return;
-          }
-          if (session && session.context.ownerId !== ownerId) {
-            sendJson(403, { error: "Signaling forbidden" });
-            return;
-          }
-          if (this.closingServerSessions.has(sessionId)) {
-            sendJson(409, { error: "Session is closing" });
-            return;
-          }
-          if (session?.negotiating || session?.trickle?.gathering) {
-            sendJson(409, { error: "Session negotiation already in progress" });
-            return;
-          }
-
-          if (!session || session.closed) {
-            pc = this.createPeerConnection({ iceServers: this.iceServers });
-            const controller = new AbortController();
-            session = {
-              controller,
-              context: Object.freeze({
-                sessionId,
-                ownerId,
-                authorization,
-                signal: controller.signal,
-              }),
-              release: () => ownedSessions.delete(sessionId),
-              id: sessionId,
-              peerConnection: pc,
-              remoteStream: this.createMediaStream(),
-              localTrackIds: new Set<string>(),
-              localStreamResolved: false,
-              ownsLocalStream: false,
-              closed: false,
-            };
-            ownedSessions.add(sessionId);
-            this.serverSessions.set(sessionId, session);
-            this.attachServerPeerEvents(session, options.onRequest);
-            this.emitServerSession(session, "created");
-          } else {
-            pc = session.peerConnection;
-          }
-
-          session.trickle?.detach();
-          delete session.trickle;
-          session.negotiating = true;
-          const activeSession = session;
-          const disconnect = () => {
-            if (!res.writableEnded) void this.closeServerSession(activeSession.id);
-          };
-          res.once("close", disconnect);
-          const onSessionAbort = () => sendJson(503, { error: "WebRTC session closed" });
-          activeSession.controller.signal.addEventListener("abort", onSessionAbort, { once: true });
-          res.once("finish", () => {
-            activeSession.controller.signal.removeEventListener("abort", onSessionAbort);
-            res.off("close", disconnect);
-          });
-          await this.setRemoteDescription(pc, payload.sdp);
-          await this.attachConfiguredServerStream(session);
-          if (session.closed) throw new Error("WebRTC session closed");
-
-          const answer = await pc.createAnswer();
-          let state: ServerTrickleState | undefined;
-          if (payload.trickle === true) {
-            const peer = pc;
-            const onCandidate = (event: { candidate?: { toJSON(): RTCIceCandidateInit } }) => {
-              if (!state || activeSession.closed || activeSession.trickle !== state) return;
-              if (state.candidates.length >= 256) {
-                void this.closeServerSession(activeSession.id);
-                return;
-              }
-              state.candidates.push(event.candidate ? event.candidate.toJSON() : null);
-            };
-            peer.addEventListener("icecandidate", onCandidate);
-            state = {
-              generation: crypto.randomUUID(),
-              candidates: [],
-              gathering: true,
-              remoteCount: 0,
-              remoteEnded: false,
-              remoteQueue: Promise.resolve(),
-              detach: () => peer.removeEventListener("icecandidate", onCandidate),
-            };
-            session.trickle = state;
-            const applying = this.withDeadline(
-              peer.setLocalDescription(answer),
-              this.iceGatheringTimeoutMs,
-              session.controller.signal,
-            );
-            let timer: ReturnType<typeof setTimeout> | undefined;
-            try {
-              await this.withDeadline(
-                new Promise<void>((resolve, reject) => {
-                  const check = () => {
-                    if (activeSession.closed) {
-                      reject(new Error("WebRTC session closed"));
-                      return;
-                    }
-                    if (
-                      peer.signalingState === "stable" &&
-                      peer.localDescription?.type === "answer"
-                    ) {
-                      resolve();
-                      return;
-                    }
-                    timer = setTimeout(check, 5);
-                  };
-                  void applying.catch(reject);
-                  check();
-                }),
-                this.iceGatheringTimeoutMs,
-                session.controller.signal,
-              );
-            } finally {
-              clearTimeout(timer);
-            }
-            void applying.then(
-              () => {
-                if (state && activeSession.trickle === state) {
-                  state.gathering = false;
-                  if (!state.candidates.includes(null)) state.candidates.push(null);
-                }
-              },
-              () => {
-                if (activeSession.trickle === state) void this.closeServerSession(activeSession.id);
-              },
-            );
-          } else {
-            await this.withDeadline(pc.setLocalDescription(answer), this.iceGatheringTimeoutMs);
-            if (!(await this.waitForIceGatheringComplete(pc, this.iceGatheringTimeoutMs)))
-              throw new Error("Full ICE gathering timed out; trickle ICE is not supported");
-          }
-
-          const localDescription = pc.localDescription;
-          if (!localDescription?.sdp || localDescription.type !== "answer") {
-            throw new Error("Local SDP answer was not generated");
-          }
-
-          if (closed || session.closed) throw new Error("WebRTC session closed");
-          session.negotiating = false;
-          sendJson(
-            200,
-            state ? { sdp: localDescription, generation: state.generation } : localDescription,
-          );
-        } catch (error) {
-          this.log("error", "[WebRtcTransport Server] Ошибка сигнализации:", error);
-          sendJson(500, { error: "Signaling failed" });
-          if (session) {
-            await this.closeServerSession(session.id);
-          } else if (pc) {
-            try {
-              await pc.close();
-            } catch {}
-          }
-        }
-      })();
+  public async listen(options: TransportListenOptions): Promise<WebRtcTransportServer> {
+    let finishStarting!: () => void;
+    const starting = new Promise<void>((resolve) => {
+      finishStarting = resolve;
     });
-
-    await new Promise<void>((resolve, reject) => {
-      const onError = (error: Error) => {
-        httpServer.off("listening", onListening);
-        reject(error);
-      };
-      const onListening = () => {
-        httpServer.off("error", onError);
-        resolve();
-      };
-      httpServer.once("error", onError);
-      httpServer.once("listening", onListening);
-      httpServer.listen(port, host);
-    });
-
-    this.log("info", `[WebRtcTransport] Listening on http://${host}:${port}${signalingPath}`);
-
-    const onAbort = () => {
-      void closeServer().catch((error) => {
-        this.log("error", "[WebRtcTransport] Server shutdown failed:", error);
+    this.pendingServerStarts.add(starting);
+    try {
+      if (options.signal?.aborted) throw new Error("WebRtcTransport: server startup aborted");
+      const signalingPath = options.signaling?.path ?? "/signal";
+      if (!isSignalingPath(signalingPath)) {
+        throw new TypeError(
+          "WebRTC signaling path must be an absolute literal pathname without query or fragment",
+        );
+      }
+      const handler = this.createSignalingHandler(options);
+      const port = options.port ?? 3000;
+      const host = options.host ?? "127.0.0.1";
+      let closePromise: Promise<void> | undefined;
+      const sockets = new Set<Socket>();
+      const httpServer: HttpServer = createServer((req, res) => {
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        req.once("aborted", abort);
+        res.once("close", abort);
+        void handler
+          .handle({
+            protocol: "webrtc",
+            method: req.method ?? "GET",
+            url: req.url ?? "/",
+            headers: Object.fromEntries(
+              Object.entries(req.headers).filter(
+                (entry): entry is [string, string | string[]] => entry[1] !== undefined,
+              ),
+            ),
+            body: req,
+            signal: controller.signal,
+          })
+          .then((response) => {
+            if (!res.headersSent && !res.destroyed) {
+              res.writeHead(response.status, response.headers);
+              res.end(response.body as string | Uint8Array | undefined);
+            }
+          })
+          .catch((error) => {
+            this.log("error", "[WebRtcTransport Server] Signaling handler failed:", error);
+            if (!res.headersSent && !res.destroyed) {
+              res.writeHead(500, {
+                "content-type": "application/json",
+                "cache-control": "no-store",
+              });
+              res.end(JSON.stringify({ error: "Signaling failed" }));
+            }
+          })
+          .finally(() => {
+            req.off("aborted", abort);
+            res.off("close", abort);
+          });
       });
-    };
-
-    const closeServer = (): Promise<void> => {
-      if (closePromise) return closePromise;
-      closed = true;
-      for (const controller of pendingAuthorizations) controller.abort();
-      options.signal?.removeEventListener("abort", onAbort);
-      closePromise = (async () => {
-        const stopped = httpServer.listening
-          ? new Promise<void>((resolve, reject) => {
-              httpServer.close((error) => (error ? reject(error) : resolve()));
-            })
-          : Promise.resolve();
-        await Promise.all([...ownedSessions].map((id) => this.closeServerSession(id)));
-        ownedSessions.clear();
-        await stopped;
-        this.serverClosers.delete(closeServer);
-      })();
-      return closePromise;
-    };
-
-    options.signal?.addEventListener("abort", onAbort, { once: true });
-    this.serverClosers.add(closeServer);
-    if (options.signal?.aborted && !closed) await closeServer();
-
-    return {
-      close: closeServer,
-      webrtc: {
-        getSession: this.getSession.bind(this),
-        getServerSession: this.getServerSession.bind(this),
-        onTrack: this.onTrack.bind(this),
-        closeServerSession: (id: string) =>
-          ownedSessions.has(id) ? this.closeServerSession(id) : Promise.resolve(),
-        onServerSession: this.onServerSession.bind(this),
-      },
-    };
+      httpServer.on("connection", (socket) => {
+        sockets.add(socket);
+        socket.once("close", () => sockets.delete(socket));
+      });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const onError = (error: Error) => {
+            httpServer.off("listening", onListening);
+            reject(error);
+          };
+          const onListening = () => {
+            httpServer.off("error", onError);
+            resolve();
+          };
+          httpServer.once("error", onError);
+          httpServer.once("listening", onListening);
+          httpServer.listen(port, host);
+        });
+      } catch (error) {
+        await handler.close();
+        throw error;
+      }
+      if (this.closing) {
+        await new Promise<void>((resolve, reject) =>
+          httpServer.close((error) => (error ? reject(error) : resolve())),
+        );
+        await handler.close();
+        throw new Error("WebRTC transport is closed");
+      }
+      this.log("info", `[WebRtcTransport] Listening on http://${host}:${port}${signalingPath}`);
+      const onAbort = () => {
+        void closeServer().catch((error) =>
+          this.log("error", "[WebRtcTransport] Server shutdown failed:", error),
+        );
+      };
+      const closeServer = (): Promise<void> => {
+        if (closePromise) return closePromise;
+        options.signal?.removeEventListener("abort", onAbort);
+        closePromise = (async () => {
+          const stopped = httpServer.listening
+            ? new Promise<void>((resolve, reject) =>
+                httpServer.close((error) => (error ? reject(error) : resolve())),
+              )
+            : Promise.resolve();
+          await handler.close();
+          // Let aborted authorization handlers serialize their 503 before forcing stalled bodies closed.
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          for (const socket of sockets) socket.destroy();
+          await stopped;
+          this.serverClosers.delete(closeServer);
+        })();
+        return closePromise;
+      };
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+      this.serverClosers.add(closeServer);
+      if (options.signal?.aborted) await closeServer();
+      return {
+        close: closeServer,
+        webrtc: {
+          getSession: this.getSession.bind(this),
+          getServerSession: this.getServerSession.bind(this),
+          onTrack: this.onTrack.bind(this),
+          closeServerSession: (id: string) => handler.closeServerSession(id),
+          onServerSession: this.onServerSession.bind(this),
+        },
+      };
+    } finally {
+      this.pendingServerStarts.delete(starting);
+      finishStarting();
+    }
   }
 
   async close(): Promise<void> {
     this.closing = true;
+    for (const controller of this.pendingClientControllers.values()) {
+      controller.abort(new Error("WebRTC transport is closed"));
+    }
     await Promise.all([...this.pendingPeers].map((pc) => pc.close().catch(() => {})));
+    await Promise.all([...this.signalingHandlers].map((handler) => handler.close()));
     await Promise.allSettled(this.connecting.values());
     await Promise.all(
       [...this.sessions.values()].map((session) => this.disposeClientSession(session, true)),
     );
     await Promise.all([...this.serverClosers].map((closeServer) => closeServer()));
+    await Promise.all(this.pendingServerStarts);
   }
 
   async destroy(): Promise<void> {
@@ -727,6 +917,7 @@ export class WebRtcTransport implements HyperTransport {
 
     if (existing) {
       await this.disposeClientSession(existing, true);
+      if (this.closing) throw new Error("WebRTC transport is closed");
     }
 
     const inFlight = this.connecting.get(peerUrl);
@@ -759,100 +950,148 @@ export class WebRtcTransport implements HyperTransport {
     const pc = this.createPeerConnection({
       iceServers: request.iceServers ?? this.iceServers,
     });
+    let channel: ClientSession["dataChannel"] | undefined;
+    let session: ClientSession | undefined;
     this.pendingPeers.add(pc);
-    const channel = pc.createDataChannel(request.channelLabel ?? "hyperttp-webrtc-transport", {
-      ordered: true,
-    });
-
-    const session: ClientSession = {
-      id,
-      peerUrl,
-      signalingUrl,
-      peerConnection: pc,
-      dataChannel: channel,
-      remoteStream: this.createMediaStream(),
-      ...(request.localStream ? { localStream: request.localStream } : {}),
-      localTrackIds: new Set<string>(),
-      pending: new Map<string, PendingResponse>(),
-      negotiation: Promise.resolve(),
-      closed: false,
-      mediaController: {} as any,
-    };
-
-    const trackListeners = new Set<
-      (e: { track: WeriftMediaStreamTrack; stream: WeriftMediaStream }) => void
-    >();
-    const trackEndedListeners = new Set<(e: { track: WeriftMediaStreamTrack }) => void>();
-    const streamListeners = new Set<(e: { stream: WeriftMediaStream }) => void>();
-
-    pc.addEventListener("track", (event: WebRtcTrackEvent) => {
-      const { track } = event;
-      if (!session.remoteStream.getTracks().includes(track)) session.remoteStream.addTrack(track);
-      for (const listener of trackListeners) listener({ track, stream: session.remoteStream });
-      for (const listener of streamListeners) listener({ stream: session.remoteStream });
-      track.addEventListener("ended", () => {
-        for (const listener of trackEndedListeners) listener({ track });
-      });
-    });
-
-    session.mediaController = {
-      localStream: session.localStream,
-      remoteStream: session.remoteStream,
-      addTrack: (track, stream) =>
-        this.queueNegotiation(session, async () => {
-          pc.addTrack(track, stream ?? session.localStream ?? this.createMediaStream());
-          if (track.id) session.localTrackIds.add(track.id);
-          await this.negotiate(session);
-        }),
-      replaceTrack: async (kind: "audio" | "video", track: any | null) => {
-        const sender = pc.getSenders().find((s: any) => s.track && s.track.kind === kind);
-        if (sender) {
-          await sender.replaceTrack(track);
-        }
-      },
-      removeTrack: (track) =>
-        this.queueNegotiation(session, async () => {
-          const sender = pc.getSenders().find((item) => item.track === track);
-          if (sender) {
-            pc.removeTrack(sender);
-            if (track.id) session.localTrackIds.delete(track.id);
-            await this.negotiate(session);
-          }
-        }),
-      close: async () => {
-        await this.disposeClientSession(session, true);
-      },
-      on(event: string, listener: any) {
-        if (event === "track") trackListeners.add(listener);
-        if (event === "trackEnded") trackEndedListeners.add(listener);
-        if (event === "stream") streamListeners.add(listener);
-        return () => {
-          trackListeners.delete(listener);
-          trackEndedListeners.delete(listener);
-          streamListeners.delete(listener);
-        };
-      },
-    };
 
     try {
-      this.attachClientPeerEvents(session);
-      this.addLocalTracks(session, request.localStream);
-      this.addReceiveTransceivers(session, request.receiveAudio, request.receiveVideo);
-      await this.negotiate(session, request.signal);
-      await this.waitForChannelOpen(channel, this.connectionTimeoutMs, request.signal);
-      return session;
+      channel = pc.createDataChannel(request.channelLabel ?? "hyperttp-webrtc-transport", {
+        ordered: true,
+      }) as unknown as ClientSession["dataChannel"];
+
+      const currentSession: ClientSession = {
+        id,
+        peerUrl,
+        signalingUrl,
+        peerConnection: pc,
+        dataChannel: channel,
+        remoteStream: this.createMediaStream(),
+        ...(request.localStream ? { localStream: request.localStream } : {}),
+        localTrackIds: new Set<string>(),
+        pending: new Map<string, PendingResponse>(),
+        negotiation: Promise.resolve(),
+        controller: new AbortController(),
+        closed: false,
+        trackEndedListenerCleanup: new Set(),
+        mediaController: {} as any,
+      };
+
+      session = currentSession;
+      this.pendingClientControllers.set(pc, currentSession.controller!);
+
+      const trackListeners = new Set<
+        (e: { track: WeriftMediaStreamTrack; stream: WeriftMediaStream }) => void
+      >();
+      const trackEndedListeners = new Set<(e: { track: WeriftMediaStreamTrack }) => void>();
+      const streamListeners = new Set<(e: { stream: WeriftMediaStream }) => void>();
+
+      const onMediaTrack = (event: WebRtcTrackEvent) => {
+        const { track } = event;
+        if (!currentSession.remoteStream.getTracks().includes(track))
+          currentSession.remoteStream.addTrack(track);
+        for (const listener of trackListeners)
+          listener({ track, stream: currentSession.remoteStream });
+        for (const listener of streamListeners) listener({ stream: currentSession.remoteStream });
+        const onTrackEnded = () => {
+          for (const listener of trackEndedListeners) listener({ track });
+        };
+        track.addEventListener("ended", onTrackEnded);
+        currentSession.trackEndedListenerCleanup.add(() =>
+          track.removeEventListener("ended", onTrackEnded),
+        );
+      };
+      pc.addEventListener("track", onMediaTrack);
+      currentSession.trackEndedListenerCleanup.add(() =>
+        pc.removeEventListener("track", onMediaTrack),
+      );
+      currentSession.trackEndedListenerCleanup.add(() => {
+        trackListeners.clear();
+        trackEndedListeners.clear();
+        streamListeners.clear();
+      });
+
+      currentSession.mediaController = {
+        localStream: currentSession.localStream,
+        remoteStream: currentSession.remoteStream,
+        addTrack: (track, stream) =>
+          this.queueNegotiation(currentSession, async () => {
+            pc.addTrack(track, stream ?? currentSession.localStream ?? this.createMediaStream());
+            if (track.id) currentSession.localTrackIds.add(track.id);
+            await this.negotiate(currentSession);
+          }),
+        replaceTrack: async (kind: "audio" | "video", track: any | null) => {
+          const sender = pc.getSenders().find((s: any) => s.track && s.track.kind === kind);
+          if (sender) {
+            await sender.replaceTrack(track);
+          }
+        },
+        removeTrack: (track) =>
+          this.queueNegotiation(currentSession, async () => {
+            const sender = pc.getSenders().find((item) => item.track === track);
+            if (sender) {
+              pc.removeTrack(sender);
+              if (track.id) currentSession.localTrackIds.delete(track.id);
+              await this.negotiate(currentSession);
+            }
+          }),
+        close: async () => {
+          await this.disposeClientSession(currentSession, true);
+        },
+        on(event: string, listener: any) {
+          if (event === "track") trackListeners.add(listener);
+          if (event === "trackEnded") trackEndedListeners.add(listener);
+          if (event === "stream") streamListeners.add(listener);
+          return () => {
+            trackListeners.delete(listener);
+            trackEndedListeners.delete(listener);
+            streamListeners.delete(listener);
+          };
+        },
+      };
+
+      this.attachClientPeerEvents(currentSession);
+      this.addLocalTracks(currentSession, request.localStream);
+      this.addReceiveTransceivers(currentSession, request.receiveAudio, request.receiveVideo);
+      await this.negotiate(currentSession, request.signal);
+      const channelController = new AbortController();
+      const abortChannel = (source: AbortSignal) => channelController.abort(source.reason);
+      const abortChannelFromRequest = () => abortChannel(request.signal!);
+      const abortChannelFromSession = () => abortChannel(currentSession.controller!.signal);
+      request.signal?.addEventListener("abort", abortChannelFromRequest, { once: true });
+      currentSession.controller?.signal.addEventListener("abort", abortChannelFromSession, {
+        once: true,
+      });
+      if (request.signal?.aborted) abortChannelFromRequest();
+      if (currentSession.controller?.signal.aborted) abortChannelFromSession();
+      try {
+        await this.waitForChannelOpen(channel, this.connectionTimeoutMs, channelController.signal);
+      } finally {
+        request.signal?.removeEventListener("abort", abortChannelFromRequest);
+        currentSession.controller?.signal.removeEventListener("abort", abortChannelFromSession);
+      }
+      return currentSession;
     } catch (error) {
-      await this.disposeClientSession(session, true);
+      if (session) {
+        await this.disposeClientSession(session, true);
+      } else {
+        try {
+          channel?.close();
+        } catch {}
+        try {
+          await pc.close();
+        } catch {}
+      }
       throw error;
     } finally {
       this.pendingPeers.delete(pc);
+      this.pendingClientControllers.delete(pc);
     }
   }
 
   private attachClientPeerEvents(session: ClientSession): void {
     const { peerConnection: pc, dataChannel: channel } = session;
 
-    pc.addEventListener("track", (event: any) => {
+    const onTrack = (event: any) => {
       const track = event.track;
       if (!session.remoteStream.getTracks().some((item: any) => item.id === track.id)) {
         session.remoteStream.addTrack(track);
@@ -867,15 +1106,21 @@ export class WebRtcTransport implements HyperTransport {
         stream: session.remoteStream,
         streams: event.streams,
       });
-    });
+    };
+    pc.addEventListener("track", onTrack);
+    session.trackEndedListenerCleanup.add(() => pc.removeEventListener("track", onTrack));
 
-    pc.addEventListener("connectionstatechange", () => {
+    const onConnectionStateChange = () => {
       if (pc.connectionState === "failed" || pc.connectionState === "closed") {
         void this.disposeClientSession(session, true);
       }
-    });
+    };
+    pc.addEventListener("connectionstatechange", onConnectionStateChange);
+    session.trackEndedListenerCleanup.add(() =>
+      pc.removeEventListener("connectionstatechange", onConnectionStateChange),
+    );
 
-    channel.addEventListener("message", (event: MessageEvent) => {
+    const onMessage = (event: MessageEvent) => {
       let message: Record<string, unknown>;
       try {
         message = JSON.parse(String(event.data)) as Record<string, unknown>;
@@ -904,16 +1149,22 @@ export class WebRtcTransport implements HyperTransport {
         this.finishPending(session, message.requestId);
         pending.reject(errorFromUnknown(error, "Invalid WebRTC response"));
       }
-    });
+    };
+    channel.addEventListener("message", onMessage);
+    session.trackEndedListenerCleanup.add(() => channel.removeEventListener("message", onMessage));
 
-    channel.addEventListener("close", () => {
+    const onClose = () => {
       this.rejectAllPending(session, new Error("WebRTC DataChannel closed"));
       void this.disposeClientSession(session, true);
-    });
+    };
+    channel.addEventListener("close", onClose);
+    session.trackEndedListenerCleanup.add(() => channel.removeEventListener("close", onClose));
 
-    channel.addEventListener("error", () => {
+    const onError = () => {
       this.rejectAllPending(session, new Error("WebRTC DataChannel error"));
-    });
+    };
+    channel.addEventListener("error", onError);
+    session.trackEndedListenerCleanup.add(() => channel.removeEventListener("error", onError));
   }
 
   private queueNegotiation(session: ClientSession, operation: () => Promise<void>): Promise<void> {
@@ -1007,53 +1258,92 @@ export class WebRtcTransport implements HyperTransport {
       throw new Error(`Cannot negotiate WebRTC session in state ${pc.signalingState}`);
     }
 
-    if (this.options.trickleIce) return this.negotiateTrickle(session, signal);
-
-    const offer = await pc.createOffer();
-    await this.withDeadline(pc.setLocalDescription(offer), this.iceGatheringTimeoutMs, signal);
-    await this.waitForIceGatheringComplete(pc, this.iceGatheringTimeoutMs);
-
-    const localDescription = pc.localDescription;
-    if (!localDescription?.sdp || localDescription.type !== "offer") {
-      throw new Error("Local SDP offer was not generated");
-    }
-
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.signalingTimeoutMs);
-    const abortListener = () => controller.abort(signal?.reason);
-    signal?.addEventListener("abort", abortListener, { once: true });
-    if (signal?.aborted) abortListener();
+    const abort = (source: AbortSignal) => controller.abort(source.reason);
+    const abortFromRequest = () => abort(signal!);
+    const abortFromSession = () => abort(session.controller!.signal);
+    signal?.addEventListener("abort", abortFromRequest, { once: true });
+    session.controller?.signal.addEventListener("abort", abortFromSession, { once: true });
+    if (signal?.aborted) abortFromRequest();
+    if (session.controller?.signal.aborted) abortFromSession();
 
     try {
-      const response = await fetch(session.signalingUrl, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ sessionId: session.id, sdp: localDescription }),
-        signal: controller.signal,
-      });
+      if (this.options.trickleIce) return this.negotiateTrickle(session, controller.signal);
 
-      if (!response.ok) {
-        const text = await response.text();
-        throw new Error(
-          `Signaling HTTP error: ${response.status} ${response.statusText}${text ? ` — ${text}` : ""}`,
+      // A peer's createOffer() cannot be cancelled, so only race the caller's
+      // wait; the peer can finish its own work after the session is closed.
+      const offer = await this.withDeadline(
+        pc.createOffer(),
+        this.signalingTimeoutMs,
+        controller.signal,
+      );
+      await this.withDeadline(
+        pc.setLocalDescription(offer),
+        this.iceGatheringTimeoutMs,
+        controller.signal,
+      );
+      await this.waitForIceGatheringComplete(pc, this.iceGatheringTimeoutMs, controller.signal);
+
+      const localDescription = pc.localDescription;
+      if (!localDescription?.sdp || localDescription.type !== "offer") {
+        throw new Error("Local SDP offer was not generated");
+      }
+
+      const signalingController = new AbortController();
+      const timer = setTimeout(() => signalingController.abort(), this.signalingTimeoutMs);
+      const abortSignaling = () => signalingController.abort(controller.signal.reason);
+      controller.signal.addEventListener("abort", abortSignaling, { once: true });
+      if (controller.signal.aborted) abortSignaling();
+
+      try {
+        const response = await this.withDeadline(
+          fetch(session.signalingUrl, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ sessionId: session.id, sdp: localDescription }),
+            signal: signalingController.signal,
+          }),
+          this.signalingTimeoutMs,
+          controller.signal,
         );
-      }
+        if (!response.ok) {
+          const text = await this.withDeadline(
+            response.text(),
+            this.signalingTimeoutMs,
+            controller.signal,
+          );
+          throw new Error(
+            `Signaling HTTP error: ${response.status} ${response.statusText}${text ? ` — ${text}` : ""}`,
+          );
+        }
 
-      const answer = (await response.json()) as RTCSessionDescriptionInit;
-      if (answer.type !== "answer" || typeof answer.sdp !== "string") {
-        throw new Error("Signaling server returned an invalid SDP answer");
+        const answer = await this.withDeadline(
+          response.json() as Promise<RTCSessionDescriptionInit>,
+          this.signalingTimeoutMs,
+          controller.signal,
+        );
+        if (answer.type !== "answer" || typeof answer.sdp !== "string") {
+          throw new Error("Signaling server returned an invalid SDP answer");
+        }
+        await this.withDeadline(
+          this.setRemoteDescription(pc, answer),
+          this.signalingTimeoutMs,
+          controller.signal,
+        );
+      } catch (error) {
+        if (signal?.aborted) throw abortError(signal);
+        if (session.controller?.signal.aborted) throw abortError(session.controller.signal);
+        if (signalingController.signal.aborted) {
+          throw new Error(`Signaling timed out after ${this.signalingTimeoutMs} ms`);
+        }
+        throw errorFromUnknown(error, "WebRTC signaling failed");
+      } finally {
+        clearTimeout(timer);
+        controller.signal.removeEventListener("abort", abortSignaling);
       }
-
-      await this.setRemoteDescription(pc, answer);
-    } catch (error) {
-      if (signal?.aborted) throw abortError(signal);
-      if (controller.signal.aborted) {
-        throw new Error(`Signaling timed out after ${this.signalingTimeoutMs} ms`);
-      }
-      throw errorFromUnknown(error, "WebRTC signaling failed");
     } finally {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", abortListener);
+      signal?.removeEventListener("abort", abortFromRequest);
+      session.controller?.signal.removeEventListener("abort", abortFromSession);
     }
   }
 
@@ -1062,8 +1352,11 @@ export class WebRtcTransport implements HyperTransport {
     const controller = new AbortController();
     session.trickleAbort = controller;
     const abort = () => controller.abort(signal?.reason);
+    const abortFromSession = () => controller.abort(session.controller!.signal.reason);
     signal?.addEventListener("abort", abort, { once: true });
+    session.controller?.signal.addEventListener("abort", abortFromSession, { once: true });
     if (signal?.aborted) abort();
+    if (session.controller?.signal.aborted) abortFromSession();
     const candidates: (RTCIceCandidateInit | null)[] = [];
     let ended = false;
     let wake: (() => void) | undefined;
@@ -1081,7 +1374,6 @@ export class WebRtcTransport implements HyperTransport {
       wake?.();
     };
     pc.addEventListener("icecandidate", onCandidate);
-    let pollTimer: ReturnType<typeof setTimeout> | undefined;
     const timeout = setTimeout(
       () => controller.abort(new Error("Trickle ICE timed out")),
       this.iceGatheringTimeoutMs + this.signalingTimeoutMs,
@@ -1097,20 +1389,14 @@ export class WebRtcTransport implements HyperTransport {
         this.iceGatheringTimeoutMs,
         controller.signal,
       );
-      await this.withDeadline(
-        new Promise<void>((resolve, reject) => {
-          const check = () => {
-            if (pc.signalingState === "have-local-offer" && pc.localDescription?.sdp)
-              return resolve();
-            pollTimer = setTimeout(check, 5);
-          };
-          void applying.catch(reject);
-          check();
-        }),
+      await waitForLocalDescription(
+        pc,
+        applying,
+        "have-local-offer",
+        "offer",
         this.iceGatheringTimeoutMs,
-        controller.signal,
+        [controller.signal],
       );
-      clearTimeout(pollTimer);
       const response = await this.withDeadline(
         fetch(session.signalingUrl, {
           method: "POST",
@@ -1121,8 +1407,10 @@ export class WebRtcTransport implements HyperTransport {
         this.signalingTimeoutMs,
         controller.signal,
       );
-      if (!response.ok)
+      if (!response.ok) {
+        cancelResponseBody(response);
         throw new Error(`Signaling HTTP error: ${response.status} ${response.statusText}`);
+      }
       const result: unknown = await this.withDeadline(
         response.json(),
         this.signalingTimeoutMs,
@@ -1174,13 +1462,20 @@ export class WebRtcTransport implements HyperTransport {
             continue;
           }
           const candidate = candidates[index++];
-          const patch = await fetch(session.signalingUrl, {
-            method: "PATCH",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ sessionId: session.id, generation, candidate }),
-            signal: controller.signal,
-          });
-          if (patch.status !== 204) throw new Error(`ICE candidate HTTP error: ${patch.status}`);
+          const patch = await this.withDeadline(
+            fetch(session.signalingUrl, {
+              method: "PATCH",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ sessionId: session.id, generation, candidate }),
+              signal: controller.signal,
+            }),
+            this.signalingTimeoutMs,
+            controller.signal,
+          );
+          if (patch.status !== 204) {
+            cancelResponseBody(patch);
+            throw new Error(`ICE candidate HTTP error: ${patch.status}`);
+          }
           if (candidate === null) return;
         }
       };
@@ -1191,9 +1486,20 @@ export class WebRtcTransport implements HyperTransport {
           url.searchParams.set("sessionId", session.id);
           url.searchParams.set("generation", generation);
           url.searchParams.set("cursor", String(cursor));
-          const pageResponse = await fetch(url, { signal: controller.signal });
-          if (!pageResponse.ok) throw new Error(`ICE polling HTTP error: ${pageResponse.status}`);
-          const page: unknown = await pageResponse.json();
+          const pageResponse = await this.withDeadline(
+            fetch(url, { signal: controller.signal }),
+            this.signalingTimeoutMs,
+            controller.signal,
+          );
+          if (!pageResponse.ok) {
+            cancelResponseBody(pageResponse);
+            throw new Error(`ICE polling HTTP error: ${pageResponse.status}`);
+          }
+          const page: unknown = await this.withDeadline(
+            pageResponse.json(),
+            this.signalingTimeoutMs,
+            controller.signal,
+          );
           if (
             !page ||
             typeof page !== "object" ||
@@ -1251,9 +1557,8 @@ export class WebRtcTransport implements HyperTransport {
     } finally {
       controller.abort();
       clearTimeout(timeout);
-      clearTimeout(pollTimer);
       pc.removeEventListener("icecandidate", onCandidate);
-      signal?.removeEventListener("abort", abort);
+      session.controller?.signal.removeEventListener("abort", abortFromSession);
       if (session.trickleAbort === controller) delete session.trickleAbort;
     }
   }
@@ -1327,7 +1632,9 @@ export class WebRtcTransport implements HyperTransport {
   private async waitForIceGatheringComplete(
     pc: WeriftPeerConnection,
     timeoutMs: number,
+    signal?: AbortSignal,
   ): Promise<boolean> {
+    if (signal?.aborted) throw abortError(signal);
     if (pc.iceGatheringState === "complete") return true;
 
     const completed = await new Promise<boolean>((resolve) => {
@@ -1337,6 +1644,7 @@ export class WebRtcTransport implements HyperTransport {
       const cleanup = () => {
         clearTimeout(timer);
         pc.removeEventListener("icegatheringstatechange", onStateChange);
+        signal?.removeEventListener("abort", onAbort);
       };
 
       const finish = (value: boolean) => {
@@ -1350,8 +1658,11 @@ export class WebRtcTransport implements HyperTransport {
         if (pc.iceGatheringState === "complete") finish(true);
       };
 
+      const onAbort = () => finish(false);
       timer = setTimeout(() => finish(false), timeoutMs);
       pc.addEventListener("icegatheringstatechange", onStateChange);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
       onStateChange();
     });
 
@@ -1475,12 +1786,15 @@ export class WebRtcTransport implements HyperTransport {
   private async disposeClientSession(session: ClientSession, notifyRemote: boolean): Promise<void> {
     if (session.closed) return;
     session.closed = true;
+    session.controller?.abort(new Error("WebRTC session closed"));
     session.trickleAbort?.abort(new Error("WebRTC session closed"));
 
     if (this.sessions.get(session.peerUrl) === session) {
       this.sessions.delete(session.peerUrl);
     }
     this.rejectAllPending(session, new Error("WebRTC session closed"));
+    for (const cleanup of session.trackEndedListenerCleanup) cleanup();
+    session.trackEndedListenerCleanup.clear();
 
     try {
       session.dataChannel.close();
@@ -1496,7 +1810,8 @@ export class WebRtcTransport implements HyperTransport {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 2_000);
         try {
-          await fetch(url, { method: "DELETE", signal: controller.signal });
+          const response = await fetch(url, { method: "DELETE", signal: controller.signal });
+          cancelResponseBody(response);
         } finally {
           clearTimeout(timer);
         }
@@ -1509,14 +1824,19 @@ export class WebRtcTransport implements HyperTransport {
     onRequest: TransportListenOptions["onRequest"],
   ): void {
     const pc = session.peerConnection;
+    const listen = (target: EventTarget, type: string, listener: EventListener): void => {
+      target.addEventListener(type, listener);
+      session.peerListenerCleanup.add(() => target.removeEventListener(type, listener));
+    };
 
-    pc.addEventListener("datachannel", (event: any) => {
+    const onDataChannel = (event: any) => {
       const channel = event.channel;
-      channel.addEventListener("message", (messageEvent: MessageEvent) => {
+      const onMessage = (messageEvent: Event) => {
         void (async () => {
+          const data = (messageEvent as MessageEvent).data;
           let requestId: string | undefined;
           try {
-            const message = JSON.parse(String(messageEvent.data)) as {
+            const message = JSON.parse(String(data)) as {
               requestId?: unknown;
               method?: unknown;
               url?: unknown;
@@ -1545,6 +1865,7 @@ export class WebRtcTransport implements HyperTransport {
                     }
                   : { "x-webrtc-session-id": session.id },
               body: decodeWireBody(message.body),
+              signal: session.controller.signal,
               protocol:
                 typeof message.protocol === "string"
                   ? (message.protocol as TransportRequest["protocol"])
@@ -1592,10 +1913,12 @@ export class WebRtcTransport implements HyperTransport {
             }
           }
         })();
-      });
-    });
+      };
+      listen(channel, "message", onMessage);
+    };
+    listen(pc, "datachannel", onDataChannel);
 
-    pc.addEventListener("track", (event: any) => {
+    const onTrack = (event: any) => {
       const track = event.track;
       if (!session.remoteStream.getTracks().some((item: any) => item.id === track.id)) {
         session.remoteStream.addTrack(track);
@@ -1608,13 +1931,15 @@ export class WebRtcTransport implements HyperTransport {
         stream: session.remoteStream,
         streams: event.streams,
       });
-    });
+    };
+    listen(pc, "track", onTrack);
 
-    pc.addEventListener("connectionstatechange", () => {
+    const onConnectionStateChange = () => {
       if (pc.connectionState === "failed" || pc.connectionState === "closed") {
         void this.closeServerSession(session.id);
       }
-    });
+    };
+    listen(pc, "connectionstatechange", onConnectionStateChange);
   }
 
   private async attachConfiguredServerStream(session: ServerSession): Promise<void> {
@@ -1623,7 +1948,28 @@ export class WebRtcTransport implements HyperTransport {
     if (!session.localStreamResolved) {
       const configured = this.options.localStream;
       const isFactory = typeof configured === "function";
-      const stream = isFactory ? await configured(session.id, session.context) : configured;
+      let stream: WeriftMediaStream | undefined;
+
+      if (isFactory) {
+        const factory = Promise.resolve().then(() => configured(session.id, session.context));
+        void factory
+          .then(
+            (lateStream) => {
+              if (!session.closed || !lateStream) return;
+              session.localStream = lateStream;
+              session.ownsLocalStream = true;
+              this.disposeServerLocalStream(session);
+            },
+            () => {},
+          )
+          .catch(() => {});
+        stream = await this.withDeadline(
+          factory,
+          this.signalingTimeoutMs,
+          session.controller.signal,
+        );
+      } else stream = configured;
+
       if (session.closed) {
         if (stream && isFactory) {
           session.localStream = stream;
@@ -1679,6 +2025,8 @@ export class WebRtcTransport implements HyperTransport {
     const session = this.serverSessions.get(sessionId);
     if (!session || session.closed) return Promise.resolve();
     session.closed = true;
+    for (const cleanup of session.peerListenerCleanup) cleanup();
+    session.peerListenerCleanup.clear();
     session.trickle?.detach();
     delete session.trickle;
     session.controller.abort();

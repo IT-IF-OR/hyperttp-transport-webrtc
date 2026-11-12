@@ -1,6 +1,6 @@
 import { createServer } from "node:net";
 import type { TransportListenOptions, TransportRequest } from "@hyperttp/types";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MediaStream, MediaStreamTrack, RTCPeerConnection, RtpHeader, RtpPacket } from "werift";
 import { WebRtcTransport } from "../src/webrtc.js";
 import { WebRtcTransport as BrowserWebRtcTransport } from "../src/browser.js";
@@ -180,6 +180,58 @@ for (const { name, create } of clients) {
         clearInterval(timer);
       }
     }, 15_000);
+
+    if (name === "Werift client") {
+      it("removes transport listeners from retained peer and channel without removing application listeners", async () => {
+        const url = await startServer(() => ({ status: 200, headers: {}, body: "ok" }));
+        const client = create();
+        cleanup.push(() => client.close());
+        await client.execute(request(url));
+        const view = client.getSession(url)!;
+        const peer = view.peerConnection;
+        const channel = view.dataChannel;
+        const peerRemove = vi.spyOn(peer, "removeEventListener");
+        const channelRemove = vi.spyOn(channel, "removeEventListener");
+        const applicationListener = vi.fn();
+        channel.addEventListener("message", applicationListener);
+        await client.close();
+        expect(peerRemove.mock.calls.filter(([type]) => type === "track")).toHaveLength(2);
+        expect(peerRemove).toHaveBeenCalledWith("connectionstatechange", expect.any(Function));
+        for (const type of ["message", "close", "error"]) {
+          expect(channelRemove).toHaveBeenCalledWith(type, expect.any(Function));
+        }
+        channel.dispatchEvent(new MessageEvent("message", { data: "application" }));
+        expect(applicationListener).toHaveBeenCalledOnce();
+      }, 15_000);
+
+      it("releases the ended listener when a consumer retains a remote track", async () => {
+        const source = new MediaStreamTrack({ kind: "audio", id: "retained-remote-track" });
+        cleanup.push(() => source.stop());
+        const url = await startServer(
+          () => ({ status: 200, headers: {}, body: "audio" }),
+          new MediaStream([source]),
+        );
+        const client = create();
+        cleanup.push(() => client.close());
+        let retainedTrack: MediaStreamTrack | undefined;
+        let removedEndedListeners = 0;
+        const unsubscribe = client.onTrack((event) => {
+          retainedTrack = event.track as unknown as MediaStreamTrack;
+          const removeEventListener = retainedTrack.removeEventListener.bind(retainedTrack);
+          retainedTrack.removeEventListener = ((type, listener) => {
+            if (type === "ended") removedEndedListeners++;
+            removeEventListener(type, listener);
+          }) as typeof retainedTrack.removeEventListener;
+        });
+        cleanup.push(unsubscribe);
+
+        await client.execute({ ...request(url), receiveAudio: true });
+        await expect.poll(() => retainedTrack).toBeDefined();
+        await client.close();
+        expect(removedEndedListeners).toBe(1);
+        retainedTrack!.dispatchEvent(new Event("ended"));
+      }, 15_000);
+    }
 
     it("rejects execute after closing an established client", async () => {
       let requests = 0;

@@ -44,6 +44,48 @@ function setup(trickleIce = true) {
 
 afterEach(() => vi.unstubAllGlobals());
 
+it.each(["POST", "PATCH", "GET"])("cancels an unused %s error response body", async (method) => {
+  const { negotiate } = setup();
+  const cancel = vi.fn();
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_url, init = {}) => {
+      const current = init.method ?? "GET";
+      if (current === method) return new Response(new ReadableStream({ cancel }), { status: 500 });
+      if (current === "POST")
+        return Response.json({ generation: "g", sdp: { type: "answer", sdp: "answer" } });
+      if (current === "PATCH") return new Response(null, { status: 204 });
+      return new Promise<Response>((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+      });
+    }),
+  );
+  await expect(negotiate()).rejects.toThrow(/HTTP error/);
+  expect(cancel).toHaveBeenCalledOnce();
+});
+
+it("cancels an unused DELETE response body on session disposal", async () => {
+  const cancel = vi.fn();
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => new Response(new ReadableStream({ cancel }), { status: 500 })),
+  );
+  const transport = new WebRtcTransport();
+  const session = {
+    closed: false,
+    peerUrl: "webrtc://localhost/signal",
+    signalingUrl: "http://localhost/signal",
+    id: "s",
+    pending: new Map(),
+    trackEndedListenerCleanup: new Set(),
+    dataChannel: { close() {} },
+    peerConnection: { close: async () => {} },
+  };
+  await (transport as any).disposeClientSession(session, true);
+  expect(cancel).toHaveBeenCalledOnce();
+  await transport.close();
+});
+
 it("exchanges trickle candidates in order after applying the answer", async () => {
   const { pc, negotiate } = setup();
   const patches: unknown[] = [];
@@ -68,6 +110,44 @@ it("exchanges trickle candidates in order after applying the answer", async () =
   await negotiate();
   expect(patches).toEqual([{ candidate: "local", sdpMid: "0" }, null]);
   expect(pc.applied).toEqual(["answer", { candidate: "remote", sdpMid: "0" }, null]);
+});
+
+it("sends the offer when signaling state changes without waiting for ICE gathering", async () => {
+  const { pc, negotiate } = setup();
+  let finishGathering!: () => void;
+  pc.setLocalDescription = () => {
+    pc.signalingState = "have-local-offer";
+    pc.dispatchEvent(new Event("signalingstatechange"));
+    return new Promise<void>((resolve) => {
+      finishGathering = () => {
+        pc.dispatchEvent(new Event("icecandidate"));
+        resolve();
+      };
+    });
+  };
+  const fetchMock = vi.fn(async (_url, init = {}) => {
+    if (init.method === "POST") {
+      finishGathering();
+      return Response.json({ generation: "g", sdp: { type: "answer", sdp: "answer" } });
+    }
+    if (init.method === "PATCH") return new Response(null, { status: 204 });
+    return Response.json({ generation: "g", candidates: [null], next: 1 });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  await negotiate();
+  expect(fetchMock).toHaveBeenCalled();
+});
+
+it("removes its signaling listener when local description is aborted", async () => {
+  const { pc, negotiate } = setup();
+  pc.setLocalDescription = () => new Promise<void>(() => {});
+  const remove = vi.spyOn(pc, "removeEventListener");
+  const controller = new AbortController();
+  const pending = negotiate(controller.signal);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  controller.abort();
+  await expect(pending).rejects.toThrow();
+  expect(remove).toHaveBeenCalledWith("signalingstatechange", expect.any(Function));
 });
 
 it("rejects invalid candidate pages", async () => {
