@@ -16,6 +16,7 @@ import {
   type WebRtcSessionView,
   type WebRtcTrackEvent,
   type WebRtcTransportOptions as InternalWebRtcTransportOptions,
+  type WeriftBandwidthEstimator,
   type WebRtcTransportRequest,
 } from "./types/types.js";
 import { abortError, decodeWireBody, encodeWireBody, errorFromUnknown } from "./utils/helper.js";
@@ -55,9 +56,13 @@ function normalizeIceServers(servers: RTCIceServer[] | undefined): WeriftIceServ
   return normalized as unknown as WeriftIceServers;
 }
 
-function createWeriftPeerConnection(configuration: RTCConfiguration): WeriftPeerConnection {
+function createWeriftPeerConnection(
+  configuration: RTCConfiguration,
+  bandwidthEstimator: WeriftBandwidthEstimator,
+): WeriftPeerConnection {
   const config = {
     iceServers: normalizeIceServers(configuration.iceServers),
+    bandwidthEstimator,
     ...(configuration.iceTransportPolicy !== undefined
       ? { iceTransportPolicy: configuration.iceTransportPolicy }
       : {}),
@@ -651,7 +656,10 @@ export class WebRtcTransport implements HyperTransport {
 
   constructor(options: WebRtcTransportOptions = {}) {
     this.options = options as unknown as InternalWebRtcTransportOptions;
-    this.createPeerConnection = options.createPeerConnection ?? createWeriftPeerConnection;
+    this.createPeerConnection =
+      options.createPeerConnection ??
+      ((configuration) =>
+        createWeriftPeerConnection(configuration, options.weriftBandwidthEstimator ?? "gcc"));
     this.createMediaStream =
       (options.createMediaStream as unknown as (() => WeriftMediaStream) | undefined) ??
       createWeriftMediaStream;

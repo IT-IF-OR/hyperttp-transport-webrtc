@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.4] - 2026-11-14
+
+### Added
+
+- Added the server-only `weriftBandwidthEstimator` option for built-in Werift peer connections. Supported values are `"gcc"`, `"lightweight"`, and `"none"`; the option is ignored when an application supplies `createPeerConnection`.
+
+### Changed
+
+- Use Werift's `"gcc"` bandwidth estimator by default for built-in peer connections. This enables Werift's bounded paced RTP sender queue, preventing an unpaced RTP burst from accumulating unbounded concurrent send operations. Applications that require Werift's former direct send behavior can explicitly set `weriftBandwidthEstimator: "lightweight"`.
+
+### Notes
+
+- GCC sender pacing complements, rather than replaces, producer-side RTP pacing. `createPcmAudioSource` and `RtpPacer` continue to control media timing and bounded source buffering.
+
 ## [0.4.2] - 2026-11-10
 
 ### Fixed

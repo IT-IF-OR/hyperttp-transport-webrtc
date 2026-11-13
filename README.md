@@ -48,6 +48,16 @@ implementation. It requires an installed FFmpeg executable with `libopus` suppor
 (`ffmpegPath` can override PATH). It encodes one shared PCM input to 20 ms Opus
 frames and delivers RTP to independent Werift tracks over IPv4 loopback UDP.
 It starts consuming immediately; late subscribers join the current position.
+
+Built-in Werift peer connections use the `"gcc"` send-side estimator by default.
+This enables Werift's bounded paced RTP queue (audio: up to 64 KiB / 200 ms),
+which drops stale queued packets instead of letting an unpaced burst accumulate
+unbounded asynchronous sends. It complements, rather than replaces, producer
+pacing: `createPcmAudioSource` and `RtpPacer` still control media timing. Set
+`weriftBandwidthEstimator: "lightweight"` only to retain Werift's direct legacy
+send path, or `"none"` to disable its estimator. The option is ignored when you
+provide `createPeerConnection`; that factory retains complete control.
+
 By default FFmpeg's `-re` paces input at its nominal rate. For a live input that
 is already paced, use `createPcmAudioSource(pcmStream, { realtime: false })` to
 avoid this second limiter. RTP is paced using its 48 kHz timestamps, with a

@@ -65,6 +65,54 @@ function request(url: string, body?: unknown): TransportRequest {
   };
 }
 
+function bandwidthEstimatorOf(peerConnection: unknown): string {
+  return (peerConnection as { config: { bandwidthEstimator: string } }).config.bandwidthEstimator;
+}
+
+describe("built-in Werift sender queue", () => {
+  it("uses GCC by default to enable Werift's bounded paced RTP queue", async () => {
+    const url = await startServer(() => ({ status: 200, headers: {}, body: "ok" }));
+    const client = new WebRtcTransport(options);
+    cleanup.push(() => client.close());
+
+    await client.execute(request(url));
+
+    expect(bandwidthEstimatorOf(client.getSession(url)!.peerConnection)).toBe("gcc");
+  }, 15_000);
+
+  it("allows selecting Werift's legacy lightweight estimator explicitly", async () => {
+    const url = await startServer(() => ({ status: 200, headers: {}, body: "ok" }));
+    const client = new WebRtcTransport({ ...options, weriftBandwidthEstimator: "lightweight" });
+    cleanup.push(() => client.close());
+
+    await client.execute(request(url));
+
+    expect(bandwidthEstimatorOf(client.getSession(url)!.peerConnection)).toBe("lightweight");
+  }, 15_000);
+
+  it("leaves a caller-provided peer factory in complete control", async () => {
+    const url = await startServer(() => ({ status: 200, headers: {}, body: "ok" }));
+    let receivedConfiguration: RTCConfiguration | undefined;
+    const client = new WebRtcTransport({
+      ...options,
+      weriftBandwidthEstimator: "gcc",
+      createPeerConnection(configuration) {
+        receivedConfiguration = configuration;
+        return new RTCPeerConnection({
+          iceServers: [],
+          bandwidthEstimator: "lightweight",
+        });
+      },
+    });
+    cleanup.push(() => client.close());
+
+    await client.execute(request(url));
+
+    expect(receivedConfiguration).toEqual({ iceServers: [] });
+    expect(bandwidthEstimatorOf(client.getSession(url)!.peerConnection)).toBe("lightweight");
+  }, 15_000);
+});
+
 const clients = [
   {
     name: "Werift client",

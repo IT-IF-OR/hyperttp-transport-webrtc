@@ -75,6 +75,8 @@ export interface WebRtcServerSessionEvent extends WebRtcServerSessionContext {
   readonly type: "created" | "closed";
 }
 
+export type WeriftBandwidthEstimator = "lightweight" | "gcc" | "none";
+
 export interface WebRtcTransportOptions {
   readonly iceServers?: RTCIceServer[];
   /** Enable incremental ICE signaling with a compatible server. Default: false. */
@@ -85,6 +87,12 @@ export interface WebRtcTransportOptions {
   readonly requestTimeoutMs?: number;
   readonly logger?: (level: LogLevel, message: string, meta?: unknown) => void;
   readonly verbose?: boolean;
+  /**
+   * Send-side estimator for built-in Werift peer connections. `"gcc"` enables
+   * Werift's bounded paced RTP sender queue. Ignored when `createPeerConnection`
+   * is provided. Default: `"gcc"`.
+   */
+  readonly weriftBandwidthEstimator?: WeriftBandwidthEstimator;
   readonly createPeerConnection?: (configuration: RTCConfiguration) => WeriftPeerConnection;
   readonly createMediaStream?: () => WeriftMediaStream;
   readonly disposeLocalStream?: (sessionId: string, stream: WeriftMediaStream) => void;
