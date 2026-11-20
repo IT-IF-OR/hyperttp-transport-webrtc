@@ -1,6 +1,6 @@
 {
   "name": "@hyperttp/transport-webrtc",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "WebRTC transport for Hyperttp powered by Werift",
   "keywords": [
     "bun",
@@ -31,6 +31,10 @@
       },
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./runtime": {
+      "types": "./dist/runtime.d.ts",
+      "import": "./dist/runtime.js"
     },
     "./pcm-audio": {
       "types": "./dist/pcm-audio.d.ts",
@@ -67,19 +71,19 @@
     "clean": "node --input-type=module -e 'import { rmSync } from \"node:fs\"; rmSync(\"dist\", { recursive: true, force: true });'"
   },
   "dependencies": {
-    "werift": "^0.27.0"
+    "werift": "^0.28.0"
   },
   "devDependencies": {
     "@dirold2/dev-tools": "^1.1.3",
-    "@types/bun": "^1.4.4",
+    "@types/bun": "^1.4.5",
     "@types/deno": "^2.7.0",
     "@types/node": "^26.6.6",
     "esbuild": "^0.28.2",
-    "oxfmt": "^0.78.0",
-    "oxlint": "^1.93.0",
-    "playwright": "^1.65.0",
+    "oxfmt": "^0.79.0",
+    "oxlint": "^1.94.0",
+    "playwright": "^1.65.1",
     "typescript": "^7.0.2",
-    "vitest": "^5.1.0"
+    "vitest": "^5.1.1"
   },
   "peerDependencies": {
     "@hyperttp/types": "^0.5.4"

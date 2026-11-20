@@ -70,6 +70,35 @@ Observe `audio.done` for EOF/encoder/input errors. Close the adapter when its
 playback session ends. Closing a listener stops only its track, not the source.
 It does not implement seeking, playback pause, or audio mixing.
 
+## Server runtime facade
+
+Applications that supply their own `createPeerConnection` factory can keep their
+Werift dependency inside this package:
+
+```ts
+import {
+  createWebRtcPeerConnection,
+  createWebRtcRuntime,
+  type WebRtcPeerConfiguration,
+} from "@hyperttp/transport-webrtc/runtime";
+
+const configuration: WebRtcPeerConfiguration = { iceServers: [] };
+const peer = createWebRtcPeerConnection(configuration);
+// await peer.close();
+
+const runtime = createWebRtcRuntime();
+const { createPeer, createAudio } = await runtime.load();
+```
+
+This **server-only** entry point loads Werift on import. `runtime.load()` caches
+loading of the PCM adapter; it does not start FFmpeg until `createAudio` is called.
+Peer creation defaults to `bandwidthEstimator: "gcc"` and preserves explicit
+configuration, including `false`, `"lightweight"` and `"none"`. The exported
+`WebRtcPeerConnection`, `WebRtcPeerConfiguration` and `WebRtcMediaStream` types are
+aliases of Werift types, not runtime-independent interfaces. Do not import this
+entry point into browser code. Applications still own peer closure and any
+application-level port reservations.
+
 ## Browser
 
 Import the explicit browser entry point so Node/Werift code is not bundled:

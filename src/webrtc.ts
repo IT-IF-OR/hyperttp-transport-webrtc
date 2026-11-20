@@ -1596,19 +1596,7 @@ export class WebRtcTransport implements HyperTransport {
     pc: WeriftPeerConnection,
     description: RTCSessionDescriptionInit,
   ): Promise<void> {
-    const previous = new Set(pc.dtlsTransports);
-    try {
-      await pc.setRemoteDescription(description);
-    } finally {
-      // Werift can replace transports while applying BUNDLE without stopping the
-      // displaced ICE sockets. They are no longer reachable by pc.close().
-      const active = new Set(pc.dtlsTransports);
-      await Promise.all(
-        [...previous]
-          .filter((transport) => !active.has(transport))
-          .map((transport) => transport.stop()),
-      );
-    }
+    await pc.setRemoteDescription(description);
   }
 
   private async withDeadline<T>(

@@ -59,3 +59,48 @@ it("exits naturally after closing a bundled audio and data-channel session", asy
   );
   expect(stdout).toContain("CLEAN_SHUTDOWN");
 }, 30_000);
+
+it("Werift closes displaced BUNDLE transports without transport-side cleanup", async () => {
+  const require = createRequire(import.meta.url);
+  const werift = new URL("../../index.mjs", pathToFileURL(require.resolve("werift"))).href;
+  const script = `
+    import assert from "node:assert/strict";
+    import { RTCPeerConnection, MediaStreamTrack } from ${JSON.stringify(werift)};
+    const offerer = new RTCPeerConnection({ iceServers: [] });
+    const answerer = new RTCPeerConnection({ iceServers: [] });
+    const track = new MediaStreamTrack({ kind: "audio" });
+    offerer.addTrack(track);
+    offerer.createDataChannel("bundle-cleanup");
+    let displaced = [];
+    try {
+      await offerer.setLocalDescription(await offerer.createOffer());
+      const previous = [...offerer.dtlsTransports];
+      await answerer.setRemoteDescription(offerer.localDescription);
+      await answerer.setLocalDescription(await answerer.createAnswer());
+      await offerer.setRemoteDescription(answerer.localDescription);
+      displaced = previous.filter(t => !offerer.dtlsTransports.includes(t));
+      assert.ok(displaced.length > 0, "Must exercise BUNDLE transport displacement");
+    } finally {
+      setTimeout(() => {
+        console.error("Raw Werift BUNDLE cleanup leaked an event-loop resource");
+        process.exit(1);
+      }, 5000).unref();
+      await offerer.close();
+      await answerer.close();
+      track.stop();
+    }
+    for (const transport of displaced) {
+      assert.equal(transport.state, "closed");
+      assert.equal(transport.iceTransport.state, "closed");
+    }
+    console.log("RAW_BUNDLE_CLEANUP");
+  `;
+  const { stdout } = await promisify(execFile)(
+    process.execPath,
+    "Deno" in globalThis
+      ? ["eval", "--no-config", "--no-lock", "--node-modules-dir=manual", script]
+      : ["--input-type=module", "-e", script],
+    { timeout: 25_000, maxBuffer: 1_000_000 },
+  );
+  expect(stdout).toContain("RAW_BUNDLE_CLEANUP");
+}, 30_000);

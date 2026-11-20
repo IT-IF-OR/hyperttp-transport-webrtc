@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.5] - 2026-11-20
+
+### Added
+
+- Added the server-only `@hyperttp/transport-webrtc/runtime` entry point with a GCC-default peer factory, a cached PCM runtime loader, and transport-owned peer, configuration and media stream type aliases. Consumers no longer need a direct Werift dependency to customize server peer creation.
+
+### Changed
+
+- Updated the Werift dependency to `^0.28.0`. The built-in GCC estimator default and the `weriftBandwidthEstimator` option remain unchanged.
+- Removed transport-side forced shutdown of displaced BUNDLE transports; Werift now owns their lifecycle and closes them with the peer connection. Added a subprocess regression test for raw Werift BUNDLE cleanup.
+
 ## [0.4.4] - 2026-11-14
 
 ### Added
