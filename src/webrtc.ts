@@ -62,6 +62,7 @@ function createWeriftPeerConnection(
 ): WeriftPeerConnection {
   const config = {
     iceServers: normalizeIceServers(configuration.iceServers),
+    iceUseDefaultStunServer: false,
     bandwidthEstimator,
     ...(configuration.iceTransportPolicy !== undefined
       ? { iceTransportPolicy: configuration.iceTransportPolicy }
@@ -663,7 +664,7 @@ export class WebRtcTransport implements HyperTransport {
     this.createMediaStream =
       (options.createMediaStream as unknown as (() => WeriftMediaStream) | undefined) ??
       createWeriftMediaStream;
-    this.iceServers = options.iceServers ?? [{ urls: "stun:stun.l.google.com:19302" }];
+    this.iceServers = options.iceServers ?? [{ urls: "stun:stun.cloudflare.com:3478" }];
     this.iceGatheringTimeoutMs = options.iceGatheringTimeoutMs ?? 10_000;
     this.signalingTimeoutMs = options.signalingTimeoutMs ?? 10_000;
     this.connectionTimeoutMs = options.connectionTimeoutMs ?? 15_000;

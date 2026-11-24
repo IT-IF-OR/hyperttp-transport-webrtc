@@ -16,7 +16,7 @@ it("supports owner-scoped trickle generations and cleans up", async () => {
   const transport = new WebRtcTransport({
     iceServers: [],
     createPeerConnection: () => {
-      const pc = new RTCPeerConnection({ iceServers: [] });
+      const pc = new RTCPeerConnection({ iceServers: [], iceUseDefaultStunServer: false });
       // Test-only hook to hold the answerer's ICE gathering open.
       const hooks = pc as unknown as { gatherCandidates(): Promise<void> };
       const gather = hooks.gatherCandidates.bind(pc);
@@ -27,7 +27,7 @@ it("supports owner-scoped trickle generations and cleans up", async () => {
       return pc;
     },
   });
-  const peer = new RTCPeerConnection({ iceServers: [] });
+  const peer = new RTCPeerConnection({ iceServers: [], iceUseDefaultStunServer: false });
   peer.createDataChannel("test");
   const url = `http://127.0.0.1:${address.port}/signal`;
   const headers = { authorization: "alice", "content-type": "application/json" };

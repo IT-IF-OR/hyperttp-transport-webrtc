@@ -27,7 +27,7 @@ it.skipIf(!available)(
       },
     });
     const subscription = audio.subscribe();
-    const server = new WeriftPeer({ iceServers: [] });
+    const server = new WeriftPeer({ iceServers: [], iceUseDefaultStunServer: false });
     const browser = await chromium.launch({
       executablePath,
       headless: true,

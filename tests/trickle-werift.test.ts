@@ -2,7 +2,7 @@ import { expect, it } from "vitest";
 import { RTCPeerConnection } from "werift";
 
 it("exposes local SDP while ICE gathering is still pending", async () => {
-  const peer = new RTCPeerConnection({ iceServers: [] });
+  const peer = new RTCPeerConnection({ iceServers: [], iceUseDefaultStunServer: false });
   peer.createDataChannel("test");
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {

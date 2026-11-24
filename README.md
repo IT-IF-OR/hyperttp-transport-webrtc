@@ -261,10 +261,14 @@ Core forwards these options unchanged. The high-level `server.webrtc.signal()`
 facade additionally injects typed application services into both callbacks.
 The default remains `/signal` without authorization for backward compatibility.
 
-## Signaling through HyperServer REST
+## Manual REST signaling adapter
 
-Use an existing REST server instead of opening the transport's standalone HTTP listener. Register all four methods, including GET and PATCH for trickle ICE:
+When a host does not load `@hyperttp/protocol-webrtc`, use the low-level adapter
+with an existing REST server. Prefer `server.webrtc.signal(path, { transport,
+authorize, onRequest })` when that protocol package is available: it creates one
+handler, injects typed services, and registers every signaling method for you.
 
+Manual registration requires all four methods, including GET and PATCH for trickle ICE:
 ```ts
 import { WebRtcTransport, createWebRtcRestSignalingHandler } from "@hyperttp/transport-webrtc";
 
@@ -287,7 +291,7 @@ await signaling.close();
 await transport.close();
 ```
 
-The REST server owns its listener; `signaling.close()` aborts active signaling operations and closes its sessions, but does not close the REST server. Use `onServerSession` to release application-owned resources. The REST transport may parse or buffer request bodies before this adapter runs, so configure its own request-size limits and authentication middleware as appropriate. Authorization must return a trusted identity rather than accepting an owner ID from the request. REST routes cannot be combined with `server.webrtc.signal()` on the same server facade.
+The REST server owns its listener; `signaling.close()` aborts active signaling operations and closes its sessions, but does not close the REST server. Use `onServerSession` to release application-owned resources. WebRTC signaling remains REST-only: DataChannel traffic always uses `WebRtcTransport`, never a gRPC endpoint sharing this listener. The REST transport may parse or buffer request bodies before this adapter runs, so configure its own request-size limits and authentication middleware as appropriate. Authorization must return a trusted identity rather than accepting an owner ID from the request. Do not combine these manual route registrations with `server.webrtc.signal()` for the same path.
 
 ## Server sessions and signaling ownership
 

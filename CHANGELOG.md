@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.6] - 2026-11-24
+
+### Added
+
+- Added a transport-agnostic REST signaling adapter that maps shared-listener REST route requests to the WebRTC signaling handler.
+
+### Changed
+
+- Documentation explicitly states that WebRTC signaling uses REST only and DataChannel traffic never uses gRPC.
+
 ## [0.4.5] - 2026-11-20
 
 ### Added

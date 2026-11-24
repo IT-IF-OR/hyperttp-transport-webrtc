@@ -80,6 +80,22 @@ describe("built-in Werift sender queue", () => {
     expect(bandwidthEstimatorOf(client.getSession(url)!.peerConnection)).toBe("gcc");
   }, 15_000);
 
+  it("does not add Werift's default STUN server to an empty ICE configuration", async () => {
+    const url = await startServer(() => ({ status: 200, headers: {}, body: "ok" }));
+    const client = new WebRtcTransport(options);
+    cleanup.push(() => client.close());
+
+    await client.execute(request(url));
+
+    expect(
+      (
+        client.getSession(url)!.peerConnection as unknown as {
+          config: { iceUseDefaultStunServer: boolean };
+        }
+      ).config.iceUseDefaultStunServer,
+    ).toBe(false);
+  }, 15_000);
+
   it("allows selecting Werift's legacy lightweight estimator explicitly", async () => {
     const url = await startServer(() => ({ status: 200, headers: {}, body: "ok" }));
     const client = new WebRtcTransport({ ...options, weriftBandwidthEstimator: "lightweight" });
@@ -125,7 +141,10 @@ const clients = [
         ...options,
         // Only adapt the injected types; all networking and media objects remain real Werift.
         createPeerConnection: () =>
-          new RTCPeerConnection({ iceServers: [] }) as unknown as globalThis.RTCPeerConnection,
+          new RTCPeerConnection({
+            iceServers: [],
+            iceUseDefaultStunServer: false,
+          }) as unknown as globalThis.RTCPeerConnection,
         createMediaStream: () => new MediaStream() as unknown as globalThis.MediaStream,
       }),
   },

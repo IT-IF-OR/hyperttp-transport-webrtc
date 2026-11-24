@@ -66,8 +66,8 @@ it("Werift closes displaced BUNDLE transports without transport-side cleanup", a
   const script = `
     import assert from "node:assert/strict";
     import { RTCPeerConnection, MediaStreamTrack } from ${JSON.stringify(werift)};
-    const offerer = new RTCPeerConnection({ iceServers: [] });
-    const answerer = new RTCPeerConnection({ iceServers: [] });
+    const offerer = new RTCPeerConnection({ iceServers: [], iceUseDefaultStunServer: false });
+    const answerer = new RTCPeerConnection({ iceServers: [], iceUseDefaultStunServer: false });
     const track = new MediaStreamTrack({ kind: "audio" });
     offerer.addTrack(track);
     offerer.createDataChannel("bundle-cleanup");

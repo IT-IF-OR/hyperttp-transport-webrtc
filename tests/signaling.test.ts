@@ -66,7 +66,7 @@ describe("transport signaling options", () => {
 
   it("returns a generic 500 and closes the session when negotiation fails", async () => {
     const { transport, url } = await start();
-    const peer = new RTCPeerConnection({ iceServers: [] });
+    const peer = new RTCPeerConnection({ iceServers: [], iceUseDefaultStunServer: false });
     const close = vi.spyOn(peer, "close");
     vi.spyOn(peer, "setRemoteDescription").mockRejectedValue(new Error("secret SDP failure"));
     vi.spyOn(
